@@ -1,8 +1,364 @@
-<!DOCTYPE html>
-<html lang="pt-PT">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<html lang="pt-PT"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Agenda dos Pequenos — Porto</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;600;700&family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap');
@@ -643,45 +999,157 @@ button[disabled]{opacity:0.6; cursor:not-allowed;}
 }
 </style>
 </head>
-<body>
+<body id="artifacts-component-root-html">
 
 <div class="page">
   <header class="hero">
     <svg class="tile-pattern" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
       <defs>
         <pattern id="azulejo" width="64" height="64" patternUnits="userSpaceOnUse">
-          <rect width="64" height="64" fill="none"/>
-          <path d="M32 4 C42 4 42 14 32 14 C22 14 22 4 32 4 Z M32 50 C42 50 42 60 32 60 C22 60 22 50 32 50 Z M4 32 C4 22 14 22 14 32 C14 42 4 42 4 32 Z M50 32 C50 22 60 22 60 32 C60 42 50 42 50 32 Z" fill="#BFE0EE"/>
-          <circle cx="32" cy="32" r="6" fill="none" stroke="#BFE0EE" stroke-width="2"/>
+          <rect width="64" height="64" fill="none"></rect>
+          <path d="M32 4 C42 4 42 14 32 14 C22 14 22 4 32 4 Z M32 50 C42 50 42 60 32 60 C22 60 22 50 32 50 Z M4 32 C4 22 14 22 14 32 C14 42 4 42 4 32 Z M50 32 C50 22 60 22 60 32 C60 42 50 42 50 32 Z" fill="#BFE0EE"></path>
+          <circle cx="32" cy="32" r="6" fill="none" stroke="#BFE0EE" stroke-width="2"></circle>
         </pattern>
       </defs>
-      <rect width="100%" height="100%" fill="url(#azulejo)"/>
+      <rect width="100%" height="100%" fill="url(#azulejo)"></rect>
     </svg>
     <div class="hero-inner">
       <p class="eyebrow">Porto · Família · Agenda</p>
       <h1>Agenda dos Pequenos</h1>
       <p class="subtitle">Eventos para crianças, reunidos a partir dos sites que a vossa família segue no Grande Porto — bibliotecas, salas de espetáculo, museus e muito mais.</p>
       <div class="hero-stats">
-        <span><b id="statEvents">—</b>eventos</span>
-        <span><b id="statSources">—</b>sites associados</span>
+        <span><b id="statEvents">17</b>eventos</span>
+        <span><b id="statSources">14</b>sites associados</span>
       </div>
     </div>
   </header>
 
-  <div class="status-banner status-banner--info" id="topStatusBanner" role="status"></div>
+  <div class="status-banner status-banner--success" id="topStatusBanner" role="status">✅ Última atualização: 04/08/2026 às 20:30 — 17 eventos encontrados.</div>
 
   <main>
-    <section class="highlights-section" id="highlightsSection" hidden aria-label="Destaques da próxima semana">
+    <section class="highlights-section" id="highlightsSection" aria-label="Destaques da próxima semana">
       <div class="highlights-header">
         <h2>✨ Na próxima semana</h2>
-        <span class="highlights-sub" id="highlightsCount"></span>
+        <span class="highlights-sub" id="highlightsCount">8 eventos nos próximos 7 dias</span>
       </div>
-      <div class="highlights-row" id="highlightsRow"></div>
+      <div class="highlights-row" id="highlightsRow">
+    <article class="highlight-card">
+      <span class="type-tag" style="background:var(--accent-coral)">Família/Diversos</span>
+      <h3 class="highlight-title">Festival de Verão SEA LIFE Porto</h3>
+      <div class="highlight-meta">Pumpkin.pt — Agenda Família</div>
+      <span class="schedule-chip">4 ago a 9 ago</span>
+      <span class="duracao-pill">termina em 5 dias</span>
+      
+      <div class="highlight-actions">
+        <a class="highlight-link" href="https://pumpkin.pt/agenda/" target="_blank" rel="noopener">Ver mais →</a>
+        <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Festival+de+Ver%C3%A3o+SEA+LIFE+Porto&amp;dates=20260804%2F20260810&amp;details=Piratas%2C+pedras+e+pinguins+no+aqu%C3%A1rio+do+Porto%0A%0Ahttps%3A%2F%2Fpumpkin.pt%2Fagenda%2F&amp;location=SEA+LIFE+Porto" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅</a>
+        <button class="share-btn" data-share-event="zqubgp1hz8mp" aria-label="Partilhar no WhatsApp">📲</button>
+      </div>
+    </article>
+  
+    <article class="highlight-card">
+      <span class="type-tag" style="background:var(--accent-marigold)">Workshop/Oficina</span>
+      <h3 class="highlight-title">Oficina de Famílias — Charcos de Serralves</h3>
+      <div class="highlight-meta">iPorto — Agenda Metropolitana da Cultura</div>
+      <span class="schedule-chip">Domingo, 9 ago · 11:00</span>
+      <span class="duracao-pill">daqui a 5 dias</span>
+      
+      <div class="highlight-actions">
+        <a class="highlight-link" href="https://iporto.amp.pt" target="_blank" rel="noopener">Ver mais →</a>
+        <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Oficina+de+Fam%C3%ADlias+%E2%80%94+Charcos+de+Serralves&amp;dates=20260809T110000%2F20260809T123000&amp;details=Explora%C3%A7%C3%A3o+multissensorial+dos+charcos+do+parque%0A%0Ahttps%3A%2F%2Fiporto.amp.pt&amp;location=Parque+de+Serralves" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅</a>
+        <button class="share-btn" data-share-event="75gorl56z8mp" aria-label="Partilhar no WhatsApp">📲</button>
+      </div>
+    </article>
+  
+    <article class="highlight-card">
+      <span class="type-tag" style="background:var(--tile-blue)">Literatura</span>
+      <h3 class="highlight-title">Sábados a Contar — Hora do Conto</h3>
+      <div class="highlight-meta">Bibliotecas Municipais do Porto</div>
+      <span class="schedule-chip">Domingo, 9 ago · 11:00</span>
+      <span class="duracao-pill">daqui a 5 dias</span>
+      <span class="free-pill">Gratuito</span>
+      <div class="highlight-actions">
+        <a class="highlight-link" href="https://bmp.cm-porto.pt/pesquisar-eventos-sc" target="_blank" rel="noopener">Ver mais →</a>
+        <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=S%C3%A1bados+a+Contar+%E2%80%94+Hora+do+Conto&amp;dates=20260809T110000%2F20260809T123000&amp;details=Hora+do+conto+e+atelier+para+fam%C3%ADlias%0A%0Ahttps%3A%2F%2Fbmp.cm-porto.pt%2Fpesquisar-eventos-sc&amp;location=Biblioteca+Municipal+Almeida+Garrett" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅</a>
+        <button class="share-btn" data-share-event="fo43arc4xonq" aria-label="Partilhar no WhatsApp">📲</button>
+      </div>
+    </article>
+  
+    <article class="highlight-card">
+      <span class="type-tag" style="background:var(--accent-marigold)">Workshop/Oficina</span>
+      <h3 class="highlight-title">Oficina de Famílias | Charcos de Serralves</h3>
+      <div class="highlight-meta">Serralves</div>
+      <span class="schedule-chip">4 ago a 28 ago · 11:00</span>
+      <span class="duracao-pill">termina em 24 dias</span>
+      
+      <div class="highlight-actions">
+        <a class="highlight-link" href="https://www.serralves.pt/en/atividades-serralves/1307-oficina-charcos-de-serralves/" target="_blank" rel="noopener">Ver mais →</a>
+        <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Oficina+de+Fam%C3%ADlias+%7C+Charcos+de+Serralves&amp;dates=20260804T110000%2F20260804T123000&amp;details=Explora%C3%A7%C3%A3o+multissensorial+de+charcos+no+Parque%0A%0ANota%3A+pode+repetir-se+entre+2026-08-04+e+2026-08-28+%E2%80%94+confirma+no+site+oficial.%0A%0Ahttps%3A%2F%2Fwww.serralves.pt%2Fen%2Fatividades-serralves%2F1307-oficina-charcos-de-serralves%2F&amp;location=Parque" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅</a>
+        <button class="share-btn" data-share-event="fqtbk5noyf1d" aria-label="Partilhar no WhatsApp">📲</button>
+      </div>
+    </article>
+  
+    <article class="highlight-card">
+      <span class="type-tag" style="background:var(--accent-sage)">Ar livre</span>
+      <h3 class="highlight-title">Vizinhanças — Domingos em família no Porto</h3>
+      <div class="highlight-meta">Pumpkin.pt — Agenda Família</div>
+      <span class="schedule-chip">9 ago a 30 ago · 10:00</span>
+      <span class="duracao-pill">termina em 26 dias</span>
+      <span class="free-pill">Gratuito</span>
+      <div class="highlight-actions">
+        <a class="highlight-link" href="https://pumpkin.pt/eventos/vizinhancas-no-porto/" target="_blank" rel="noopener">Ver mais →</a>
+        <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Vizinhan%C3%A7as+%E2%80%94+Domingos+em+fam%C3%ADlia+no+Porto&amp;dates=20260809T100000%2F20260809T113000&amp;details=Teatro%2C+circo%2C+m%C3%BAsica+e+oficinas+ao+ar+livre%0A%0ANota%3A+pode+repetir-se+entre+2026-08-09+e+2026-08-30+%E2%80%94+confirma+no+site+oficial.%0A%0Ahttps%3A%2F%2Fpumpkin.pt%2Feventos%2Fvizinhancas-no-porto%2F&amp;location=V%C3%A1rios+espa%C3%A7os+p%C3%BAblicos+do+Porto" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅</a>
+        <button class="share-btn" data-share-event="m1a6ms6qz8mp" aria-label="Partilhar no WhatsApp">📲</button>
+      </div>
+    </article>
+  
+    <article class="highlight-card">
+      <span class="type-tag" style="background:var(--accent-sage)">Ar livre</span>
+      <h3 class="highlight-title">Zoo Radical – Atrações de Verão</h3>
+      <div class="highlight-meta">Zoo Santo Inácio</div>
+      <span class="schedule-chip">4 ago a 30 set · 10:00</span>
+      <span class="duracao-pill">termina em 57 dias</span>
+      
+      <div class="highlight-actions">
+        <a class="highlight-link" href="https://www.zoosantoinacio.com" target="_blank" rel="noopener">Ver mais →</a>
+        <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Zoo+Radical+%E2%80%93+Atra%C3%A7%C3%B5es+de+Ver%C3%A3o&amp;dates=20260804T100000%2F20260804T113000&amp;details=Montanha+russa%2C+bungee+e+carrossel+ecol%C3%B3gico+no+Zoo%0A%0ANota%3A+pode+repetir-se+entre+2026-08-04+e+2026-09-30+%E2%80%94+confirma+no+site+oficial.%0A%0Ahttps%3A%2F%2Fwww.zoosantoinacio.com&amp;location=Zoo+Santo+In%C3%A1cio%2C+Vila+Nova+de+Gaia" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅</a>
+        <button class="share-btn" data-share-event="4suughd8yf1d" aria-label="Partilhar no WhatsApp">📲</button>
+      </div>
+    </article>
+  
+    <article class="highlight-card">
+      <span class="type-tag" style="background:var(--tile-blue-deep)">Exposição</span>
+      <h3 class="highlight-title">World of Discoveries — Museu Interativo</h3>
+      <div class="highlight-meta">World of Discoveries</div>
+      <span class="schedule-chip">4 ago a 3 out · 10:00</span>
+      <span class="duracao-pill">termina em 60 dias</span>
+      
+      <div class="highlight-actions">
+        <a class="highlight-link" href="https://www.worldofdiscoveries.com" target="_blank" rel="noopener">Ver mais →</a>
+        <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=World+of+Discoveries+%E2%80%94+Museu+Interativo&amp;dates=20260804T100000%2F20260804T113000&amp;details=Museu+imersivo+sobre+os+Descobrimentos+portugueses%0A%0ANota%3A+pode+repetir-se+entre+2026-08-04+e+2026-10-03+%E2%80%94+confirma+no+site+oficial.%0A%0Ahttps%3A%2F%2Fwww.worldofdiscoveries.com&amp;location=Rua+de+Miragaia+106%2C+Porto" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅</a>
+        <button class="share-btn" data-share-event="yenh1om9z8mp" aria-label="Partilhar no WhatsApp">📲</button>
+      </div>
+    </article>
+  
+    <article class="highlight-card">
+      <span class="type-tag" style="background:var(--accent-coral)">Família/Diversos</span>
+      <h3 class="highlight-title">Nano Mino Micro – Programa para a Infância do Porto</h3>
+      <div class="highlight-meta">Museu da Cidade do Porto</div>
+      <span class="schedule-chip">4 ago a 19 dez</span>
+      <span class="duracao-pill">termina em 137 dias</span>
+      
+      <div class="highlight-actions">
+        <a class="highlight-link" href="https://museudoporto.pt/en/" target="_blank" rel="noopener">Ver mais →</a>
+        <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Nano+Mino+Micro+%E2%80%93+Programa+para+a+Inf%C3%A2ncia+do+Porto&amp;dates=20260804%2F20261220&amp;details=Programa+infantil+continuado+na+Biblioteca+Garrett%0A%0Ahttps%3A%2F%2Fmuseudoporto.pt%2Fen%2F&amp;location=Biblioteca+Municipal+Almeida+Garrett" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅</a>
+        <button class="share-btn" data-share-event="m5u38m1vyf1d" aria-label="Partilhar no WhatsApp">📲</button>
+      </div>
+    </article>
+  </div>
     </section>
 
     <section class="controls" aria-label="Filtros">
       <div class="control-row">
-        <input type="search" id="searchInput" placeholder="Procurar pelo nome do evento, local ou site…" aria-label="Procurar evento" />
+        <input type="search" id="searchInput" placeholder="Procurar pelo nome do evento, local ou site…" aria-label="Procurar evento">
       </div>
       <div class="control-row">
         <div class="filter-group">
@@ -711,30 +1179,546 @@ button[disabled]{opacity:0.6; cursor:not-allowed;}
       <div class="control-row">
         <div class="filter-group grow">
           <span class="filter-label">Tipo de evento</span>
-          <select id="typeSelect"></select>
+          <select id="typeSelect"><option value="todas">Todos os tipos</option><option value="Literatura">Literatura</option><option value="Workshop/Oficina">Workshop/Oficina</option><option value="Música">Música</option><option value="Teatro/Espetáculo">Teatro/Espetáculo</option><option value="Exposição">Exposição</option><option value="Ar livre">Ar livre</option><option value="Família/Diversos">Família/Diversos</option><option value="Cinema">Cinema</option><option value="Outro">Outro</option></select>
         </div>
         <div class="filter-group grow">
           <span class="filter-label">Local / site</span>
-          <select id="sourceSelect"></select>
+          <select id="sourceSelect"><option value="todas">Todos os locais</option><option value="Balleteatro">Balleteatro</option><option value="Bibliotecas Municipais do Porto">Bibliotecas Municipais do Porto</option><option value="Casa da Música">Casa da Música</option><option value="Coliseu Porto Ageas">Coliseu Porto Ageas</option><option value="iPorto — Agenda Metropolitana da Cultura">iPorto — Agenda Metropolitana da Cultura</option><option value="Museu da Cidade do Porto">Museu da Cidade do Porto</option><option value="Pumpkin.pt — Agenda Família">Pumpkin.pt — Agenda Família</option><option value="SEA LIFE Porto">SEA LIFE Porto</option><option value="Serralves">Serralves</option><option value="Teatro Municipal do Porto">Teatro Municipal do Porto</option><option value="Teatro Nacional São João">Teatro Nacional São João</option><option value="Viral Agenda — Porto Kids">Viral Agenda — Porto Kids</option><option value="World of Discoveries">World of Discoveries</option><option value="Zoo Santo Inácio">Zoo Santo Inácio</option></select>
         </div>
         <div class="filter-group grow">
           <span class="filter-label">Quando</span>
-          <select id="quandoSelect"></select>
+          <select id="quandoSelect">
+    <option value="todas">Todas as datas futuras</option>
+    <option value="hoje">Hoje</option>
+    <option value="semana">Próximos 7 dias</option>
+    <option value="mes">Próximos 30 dias</option>
+  </select>
         </div>
       </div>
     </section>
 
     <section class="results" aria-label="Lista de eventos">
       <div class="results-header">
-        <h2 id="resultsCount">A carregar…</h2>
+        <h2 id="resultsCount">17 eventos encontrados</h2>
         <div class="refresh-area">
           <button class="btn-secondary" id="calendarBtn">📅 Ver calendário</button>
-          <span class="refresh-meta" id="refreshMeta"></span>
+          <button class="btn-primary" id="refreshBtn">↻ Atualizar eventos</button>
+          <span class="refresh-meta" id="refreshMeta">17 eventos encontrados em 3 lote(s).</span>
         </div>
       </div>
       <p class="hint-banner">💡 O botão "Atualizar eventos" pesquisa nos sites associados e procura eventos futuros para crianças. É uma pesquisa automática — confirmem sempre datas, horários e inscrições no site oficial antes de planear a saída.</p>
-      <div id="eventsGrid" class="events-grid"></div>
-      <div id="emptyState" class="empty-state" hidden>
+      <div id="eventsGrid" class="events-grid">
+    <article class="event-card">
+      <div class="event-card-top">
+        <div>
+          <span class="type-tag" style="background:var(--accent-coral)">Família/Diversos</span>
+          <h3 class="event-title">Festival de Verão SEA LIFE Porto</h3>
+        </div>
+        <div class="event-card-top-right">
+          <div class="age-stamp"><b>2–14</b><small>anos</small></div>
+          <button class="fav-btn " data-fav-event="zqubgp1hz8mp" aria-label="Adicionar aos favoritos">☆</button>
+        </div>
+      </div>
+      <div class="event-card-body">
+        <div class="pill-row">
+          
+          
+          
+        </div>
+        <div class="event-meta-line"><b>Pumpkin.pt — Agenda Família</b></div>
+        <div class="event-meta-line">SEA LIFE Porto</div>
+        <a class="schedule-chip schedule-chip--link" href="https://pumpkin.pt/agenda/" target="_blank" rel="noopener">4 ago a 9 ago ↗</a><span class="duracao-pill">termina em 5 dias</span>
+        <p class="event-desc">Piratas, pedras e pinguins no aquário do Porto</p>
+        <div class="card-actions card-actions--footer">
+          <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Festival+de+Ver%C3%A3o+SEA+LIFE+Porto&amp;dates=20260804%2F20260810&amp;details=Piratas%2C+pedras+e+pinguins+no+aqu%C3%A1rio+do+Porto%0A%0Ahttps%3A%2F%2Fpumpkin.pt%2Fagenda%2F&amp;location=SEA+LIFE+Porto" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅 Calendar</a>
+          <button class="edit-btn" data-edit-event="zqubgp1hz8mp" aria-label="Editar evento">✏️ Editar</button>
+          <button class="share-btn" data-share-event="zqubgp1hz8mp" aria-label="Partilhar no WhatsApp">📲 Partilhar</button>
+          <button class="remove-btn" data-remove-event="zqubgp1hz8mp" aria-label="Remover evento">🗑</button>
+        </div>
+      </div>
+    </article>
+  
+    <article class="event-card">
+      <div class="event-card-top">
+        <div>
+          <span class="type-tag" style="background:var(--accent-marigold)">Workshop/Oficina</span>
+          <h3 class="event-title">Oficina de Famílias — Charcos de Serralves</h3>
+        </div>
+        <div class="event-card-top-right">
+          <div class="age-stamp"><b>0–14</b><small>anos</small></div>
+          <button class="fav-btn " data-fav-event="75gorl56z8mp" aria-label="Adicionar aos favoritos">☆</button>
+        </div>
+      </div>
+      <div class="event-card-body">
+        <div class="pill-row">
+          
+          
+          
+        </div>
+        <div class="event-meta-line"><b>iPorto — Agenda Metropolitana da Cultura</b></div>
+        <div class="event-meta-line">Parque de Serralves</div>
+        <a class="schedule-chip schedule-chip--link" href="https://iporto.amp.pt" target="_blank" rel="noopener">Domingo, 9 ago · 11:00 ↗</a><span class="duracao-pill">daqui a 5 dias</span>
+        <p class="event-desc">Exploração multissensorial dos charcos do parque</p>
+        <div class="card-actions card-actions--footer">
+          <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Oficina+de+Fam%C3%ADlias+%E2%80%94+Charcos+de+Serralves&amp;dates=20260809T110000%2F20260809T123000&amp;details=Explora%C3%A7%C3%A3o+multissensorial+dos+charcos+do+parque%0A%0Ahttps%3A%2F%2Fiporto.amp.pt&amp;location=Parque+de+Serralves" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅 Calendar</a>
+          <button class="edit-btn" data-edit-event="75gorl56z8mp" aria-label="Editar evento">✏️ Editar</button>
+          <button class="share-btn" data-share-event="75gorl56z8mp" aria-label="Partilhar no WhatsApp">📲 Partilhar</button>
+          <button class="remove-btn" data-remove-event="75gorl56z8mp" aria-label="Remover evento">🗑</button>
+        </div>
+      </div>
+    </article>
+  
+    <article class="event-card">
+      <div class="event-card-top">
+        <div>
+          <span class="type-tag" style="background:var(--tile-blue)">Literatura</span>
+          <h3 class="event-title">Sábados a Contar — Hora do Conto</h3>
+        </div>
+        <div class="event-card-top-right">
+          <div class="age-stamp"><b>3–10</b><small>anos</small></div>
+          <button class="fav-btn " data-fav-event="fo43arc4xonq" aria-label="Adicionar aos favoritos">☆</button>
+        </div>
+      </div>
+      <div class="event-card-body">
+        <div class="pill-row">
+          <span class="free-pill">Gratuito</span>
+          
+          
+        </div>
+        <div class="event-meta-line"><b>Bibliotecas Municipais do Porto</b></div>
+        <div class="event-meta-line">Biblioteca Municipal Almeida Garrett</div>
+        <a class="schedule-chip schedule-chip--link" href="https://bmp.cm-porto.pt/pesquisar-eventos-sc" target="_blank" rel="noopener">Domingo, 9 ago · 11:00 ↗</a><span class="duracao-pill">daqui a 5 dias</span>
+        <p class="event-desc">Hora do conto e atelier para famílias</p>
+        <div class="card-actions card-actions--footer">
+          <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=S%C3%A1bados+a+Contar+%E2%80%94+Hora+do+Conto&amp;dates=20260809T110000%2F20260809T123000&amp;details=Hora+do+conto+e+atelier+para+fam%C3%ADlias%0A%0Ahttps%3A%2F%2Fbmp.cm-porto.pt%2Fpesquisar-eventos-sc&amp;location=Biblioteca+Municipal+Almeida+Garrett" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅 Calendar</a>
+          <button class="edit-btn" data-edit-event="fo43arc4xonq" aria-label="Editar evento">✏️ Editar</button>
+          <button class="share-btn" data-share-event="fo43arc4xonq" aria-label="Partilhar no WhatsApp">📲 Partilhar</button>
+          <button class="remove-btn" data-remove-event="fo43arc4xonq" aria-label="Remover evento">🗑</button>
+        </div>
+      </div>
+    </article>
+  
+    <article class="event-card">
+      <div class="event-card-top">
+        <div>
+          <span class="type-tag" style="background:var(--accent-marigold)">Workshop/Oficina</span>
+          <h3 class="event-title">Oficina de Famílias | Casa: Estufa</h3>
+        </div>
+        <div class="event-card-top-right">
+          <div class="age-stamp"><b>0–14</b><small>anos</small></div>
+          <button class="fav-btn " data-fav-event="rz5d91pbyf1d" aria-label="Adicionar aos favoritos">☆</button>
+        </div>
+      </div>
+      <div class="event-card-body">
+        <div class="pill-row">
+          
+          
+          
+        </div>
+        <div class="event-meta-line"><b>Serralves</b></div>
+        <div class="event-meta-line">Parque</div>
+        <a class="schedule-chip schedule-chip--link" href="https://www.serralves.pt/en/" target="_blank" rel="noopener">Sábado, 22 ago · 11:00 ↗</a><span class="duracao-pill">daqui a 18 dias</span>
+        <p class="event-desc">Oficina familiar sobre a estufa do Parque</p>
+        <div class="card-actions card-actions--footer">
+          <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Oficina+de+Fam%C3%ADlias+%7C+Casa%3A+Estufa&amp;dates=20260822T110000%2F20260822T123000&amp;details=Oficina+familiar+sobre+a+estufa+do+Parque%0A%0Ahttps%3A%2F%2Fwww.serralves.pt%2Fen%2F&amp;location=Parque" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅 Calendar</a>
+          <button class="edit-btn" data-edit-event="rz5d91pbyf1d" aria-label="Editar evento">✏️ Editar</button>
+          <button class="share-btn" data-share-event="rz5d91pbyf1d" aria-label="Partilhar no WhatsApp">📲 Partilhar</button>
+          <button class="remove-btn" data-remove-event="rz5d91pbyf1d" aria-label="Remover evento">🗑</button>
+        </div>
+      </div>
+    </article>
+  
+    <article class="event-card">
+      <div class="event-card-top">
+        <div>
+          <span class="type-tag" style="background:var(--accent-marigold)">Workshop/Oficina</span>
+          <h3 class="event-title">Oficina de Famílias — Casa: Estufa (Serralves)</h3>
+        </div>
+        <div class="event-card-top-right">
+          <div class="age-stamp"><b>0–14</b><small>anos</small></div>
+          <button class="fav-btn " data-fav-event="xgu29uipz8mp" aria-label="Adicionar aos favoritos">☆</button>
+        </div>
+      </div>
+      <div class="event-card-body">
+        <div class="pill-row">
+          
+          
+          
+        </div>
+        <div class="event-meta-line"><b>iPorto — Agenda Metropolitana da Cultura</b></div>
+        <div class="event-meta-line">Parque de Serralves</div>
+        <a class="schedule-chip schedule-chip--link" href="https://iporto.amp.pt" target="_blank" rel="noopener">Domingo, 23 ago · 11:00 ↗</a><span class="duracao-pill">daqui a 19 dias</span>
+        <p class="event-desc">Visita interativa às estufas do parque</p>
+        <div class="card-actions card-actions--footer">
+          <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Oficina+de+Fam%C3%ADlias+%E2%80%94+Casa%3A+Estufa+%28Serralves%29&amp;dates=20260823T110000%2F20260823T123000&amp;details=Visita+interativa+%C3%A0s+estufas+do+parque%0A%0Ahttps%3A%2F%2Fiporto.amp.pt&amp;location=Parque+de+Serralves" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅 Calendar</a>
+          <button class="edit-btn" data-edit-event="xgu29uipz8mp" aria-label="Editar evento">✏️ Editar</button>
+          <button class="share-btn" data-share-event="xgu29uipz8mp" aria-label="Partilhar no WhatsApp">📲 Partilhar</button>
+          <button class="remove-btn" data-remove-event="xgu29uipz8mp" aria-label="Remover evento">🗑</button>
+        </div>
+      </div>
+    </article>
+  
+    <article class="event-card">
+      <div class="event-card-top">
+        <div>
+          <span class="type-tag" style="background:var(--accent-marigold)">Workshop/Oficina</span>
+          <h3 class="event-title">Oficina de Famílias | Charcos de Serralves</h3>
+        </div>
+        <div class="event-card-top-right">
+          <div class="age-stamp"><b>0–14</b><small>anos</small></div>
+          <button class="fav-btn " data-fav-event="fqtbk5noyf1d" aria-label="Adicionar aos favoritos">☆</button>
+        </div>
+      </div>
+      <div class="event-card-body">
+        <div class="pill-row">
+          
+          
+          
+        </div>
+        <div class="event-meta-line"><b>Serralves</b></div>
+        <div class="event-meta-line">Parque</div>
+        <a class="schedule-chip schedule-chip--link" href="https://www.serralves.pt/en/atividades-serralves/1307-oficina-charcos-de-serralves/" target="_blank" rel="noopener">4 ago a 28 ago · 11:00 ↗</a><span class="duracao-pill">termina em 24 dias</span>
+        <p class="event-desc">Exploração multissensorial de charcos no Parque</p>
+        <div class="card-actions card-actions--footer">
+          <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Oficina+de+Fam%C3%ADlias+%7C+Charcos+de+Serralves&amp;dates=20260804T110000%2F20260804T123000&amp;details=Explora%C3%A7%C3%A3o+multissensorial+de+charcos+no+Parque%0A%0ANota%3A+pode+repetir-se+entre+2026-08-04+e+2026-08-28+%E2%80%94+confirma+no+site+oficial.%0A%0Ahttps%3A%2F%2Fwww.serralves.pt%2Fen%2Fatividades-serralves%2F1307-oficina-charcos-de-serralves%2F&amp;location=Parque" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅 Calendar</a>
+          <button class="edit-btn" data-edit-event="fqtbk5noyf1d" aria-label="Editar evento">✏️ Editar</button>
+          <button class="share-btn" data-share-event="fqtbk5noyf1d" aria-label="Partilhar no WhatsApp">📲 Partilhar</button>
+          <button class="remove-btn" data-remove-event="fqtbk5noyf1d" aria-label="Remover evento">🗑</button>
+        </div>
+      </div>
+    </article>
+  
+    <article class="event-card">
+      <div class="event-card-top">
+        <div>
+          <span class="type-tag" style="background:var(--accent-sage)">Ar livre</span>
+          <h3 class="event-title">Vizinhanças — Domingos em família no Porto</h3>
+        </div>
+        <div class="event-card-top-right">
+          <div class="age-stamp"><b>0–14</b><small>anos</small></div>
+          <button class="fav-btn " data-fav-event="m1a6ms6qz8mp" aria-label="Adicionar aos favoritos">☆</button>
+        </div>
+      </div>
+      <div class="event-card-body">
+        <div class="pill-row">
+          <span class="free-pill">Gratuito</span>
+          
+          
+        </div>
+        <div class="event-meta-line"><b>Pumpkin.pt — Agenda Família</b></div>
+        <div class="event-meta-line">Vários espaços públicos do Porto</div>
+        <a class="schedule-chip schedule-chip--link" href="https://pumpkin.pt/eventos/vizinhancas-no-porto/" target="_blank" rel="noopener">9 ago a 30 ago · 10:00 ↗</a><span class="duracao-pill">termina em 26 dias</span>
+        <p class="event-desc">Teatro, circo, música e oficinas ao ar livre</p>
+        <div class="card-actions card-actions--footer">
+          <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Vizinhan%C3%A7as+%E2%80%94+Domingos+em+fam%C3%ADlia+no+Porto&amp;dates=20260809T100000%2F20260809T113000&amp;details=Teatro%2C+circo%2C+m%C3%BAsica+e+oficinas+ao+ar+livre%0A%0ANota%3A+pode+repetir-se+entre+2026-08-09+e+2026-08-30+%E2%80%94+confirma+no+site+oficial.%0A%0Ahttps%3A%2F%2Fpumpkin.pt%2Feventos%2Fvizinhancas-no-porto%2F&amp;location=V%C3%A1rios+espa%C3%A7os+p%C3%BAblicos+do+Porto" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅 Calendar</a>
+          <button class="edit-btn" data-edit-event="m1a6ms6qz8mp" aria-label="Editar evento">✏️ Editar</button>
+          <button class="share-btn" data-share-event="m1a6ms6qz8mp" aria-label="Partilhar no WhatsApp">📲 Partilhar</button>
+          <button class="remove-btn" data-remove-event="m1a6ms6qz8mp" aria-label="Remover evento">🗑</button>
+        </div>
+      </div>
+    </article>
+  
+    <article class="event-card">
+      <div class="event-card-top">
+        <div>
+          <span class="type-tag" style="background:var(--tile-blue)">Literatura</span>
+          <h3 class="event-title">Feira do Livro do Porto 2026</h3>
+        </div>
+        <div class="event-card-top-right">
+          <div class="age-stamp"><b>0–14</b><small>anos</small></div>
+          <button class="fav-btn " data-fav-event="o7qxhkbcz8mp" aria-label="Adicionar aos favoritos">☆</button>
+        </div>
+      </div>
+      <div class="event-card-body">
+        <div class="pill-row">
+          <span class="free-pill">Gratuito</span>
+          
+          
+        </div>
+        <div class="event-meta-line"><b>Pumpkin.pt — Agenda Família</b></div>
+        <div class="event-meta-line">Jardins do Palácio de Cristal</div>
+        <a class="schedule-chip schedule-chip--link" href="https://pumpkin.pt/agenda/" target="_blank" rel="noopener">21 ago a 6 set · 11:00 ↗</a><span class="duracao-pill">termina em 33 dias</span>
+        <p class="event-desc">Literatura infantil e atividades gratuitas para famílias</p>
+        <div class="card-actions card-actions--footer">
+          <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Feira+do+Livro+do+Porto+2026&amp;dates=20260821T110000%2F20260821T123000&amp;details=Literatura+infantil+e+atividades+gratuitas+para+fam%C3%ADlias%0A%0ANota%3A+pode+repetir-se+entre+2026-08-21+e+2026-09-06+%E2%80%94+confirma+no+site+oficial.%0A%0Ahttps%3A%2F%2Fpumpkin.pt%2Fagenda%2F&amp;location=Jardins+do+Pal%C3%A1cio+de+Cristal" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅 Calendar</a>
+          <button class="edit-btn" data-edit-event="o7qxhkbcz8mp" aria-label="Editar evento">✏️ Editar</button>
+          <button class="share-btn" data-share-event="o7qxhkbcz8mp" aria-label="Partilhar no WhatsApp">📲 Partilhar</button>
+          <button class="remove-btn" data-remove-event="o7qxhkbcz8mp" aria-label="Remover evento">🗑</button>
+        </div>
+      </div>
+    </article>
+  
+    <article class="event-card">
+      <div class="event-card-top">
+        <div>
+          <span class="type-tag" style="background:var(--accent-plum)">Teatro/Espetáculo</span>
+          <h3 class="event-title">Quebra-Cabeças — espetáculo para escolas e famílias</h3>
+        </div>
+        <div class="event-card-top-right">
+          <div class="age-stamp"><b>3–12</b><small>anos</small></div>
+          <button class="fav-btn " data-fav-event="ch6p6rhcxonq" aria-label="Adicionar aos favoritos">☆</button>
+        </div>
+      </div>
+      <div class="event-card-body">
+        <div class="pill-row">
+          
+          
+          
+        </div>
+        <div class="event-meta-line"><b>Teatro Municipal do Porto</b></div>
+        <div class="event-meta-line">Campo Alegre Exterior</div>
+        <a class="schedule-chip schedule-chip--link" href="https://www.teatromunicipaldoporto.pt" target="_blank" rel="noopener">5 set a 6 set · 10:30 ↗</a><span class="duracao-pill">termina em 33 dias</span>
+        <p class="event-desc">Espetáculo ao ar livre para crianças e escolas</p>
+        <div class="card-actions card-actions--footer">
+          <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Quebra-Cabe%C3%A7as+%E2%80%94+espet%C3%A1culo+para+escolas+e+fam%C3%ADlias&amp;dates=20260905T103000%2F20260905T120000&amp;details=Espet%C3%A1culo+ao+ar+livre+para+crian%C3%A7as+e+escolas%0A%0ANota%3A+pode+repetir-se+entre+2026-09-05+e+2026-09-06+%E2%80%94+confirma+no+site+oficial.%0A%0Ahttps%3A%2F%2Fwww.teatromunicipaldoporto.pt&amp;location=Campo+Alegre+Exterior" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅 Calendar</a>
+          <button class="edit-btn" data-edit-event="ch6p6rhcxonq" aria-label="Editar evento">✏️ Editar</button>
+          <button class="share-btn" data-share-event="ch6p6rhcxonq" aria-label="Partilhar no WhatsApp">📲 Partilhar</button>
+          <button class="remove-btn" data-remove-event="ch6p6rhcxonq" aria-label="Remover evento">🗑</button>
+        </div>
+      </div>
+    </article>
+  
+    <article class="event-card">
+      <div class="event-card-top">
+        <div>
+          <span class="type-tag" style="background:var(--accent-sage)">Ar livre</span>
+          <h3 class="event-title">Astronomia no Parque</h3>
+        </div>
+        <div class="event-card-top-right">
+          <div class="age-stamp"><b>0–14</b><small>anos</small></div>
+          <button class="fav-btn " data-fav-event="r6kv67dvyf1d" aria-label="Adicionar aos favoritos">☆</button>
+        </div>
+      </div>
+      <div class="event-card-body">
+        <div class="pill-row">
+          
+          
+          
+        </div>
+        <div class="event-meta-line"><b>Serralves</b></div>
+        <div class="event-meta-line">Clareira dos Teixos</div>
+        <a class="schedule-chip schedule-chip--link" href="https://www.serralves.pt/en/" target="_blank" rel="noopener">21 ago a 7 set · 21:30 ↗</a><span class="duracao-pill">termina em 34 dias</span>
+        <p class="event-desc">Noites de astronomia ao ar livre em família</p>
+        <div class="card-actions card-actions--footer">
+          <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Astronomia+no+Parque&amp;dates=20260821T213000%2F20260821T230000&amp;details=Noites+de+astronomia+ao+ar+livre+em+fam%C3%ADlia%0A%0ANota%3A+pode+repetir-se+entre+2026-08-21+e+2026-09-07+%E2%80%94+confirma+no+site+oficial.%0A%0Ahttps%3A%2F%2Fwww.serralves.pt%2Fen%2F&amp;location=Clareira+dos+Teixos" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅 Calendar</a>
+          <button class="edit-btn" data-edit-event="r6kv67dvyf1d" aria-label="Editar evento">✏️ Editar</button>
+          <button class="share-btn" data-share-event="r6kv67dvyf1d" aria-label="Partilhar no WhatsApp">📲 Partilhar</button>
+          <button class="remove-btn" data-remove-event="r6kv67dvyf1d" aria-label="Remover evento">🗑</button>
+        </div>
+      </div>
+    </article>
+  
+    <article class="event-card">
+      <div class="event-card-top">
+        <div>
+          <span class="type-tag" style="background:var(--accent-plum)">Teatro/Espetáculo</span>
+          <h3 class="event-title">Quero um Piano</h3>
+        </div>
+        <div class="event-card-top-right">
+          <div class="age-stamp"><b>4–12</b><small>anos</small></div>
+          <button class="fav-btn " data-fav-event="s6t77bxwxonq" aria-label="Adicionar aos favoritos">☆</button>
+        </div>
+      </div>
+      <div class="event-card-body">
+        <div class="pill-row">
+          
+          
+          
+        </div>
+        <div class="event-meta-line"><b>Teatro Municipal do Porto</b></div>
+        <div class="event-meta-line">Campo Alegre Café-Teatro</div>
+        <a class="schedule-chip schedule-chip--link" href="https://www.teatromunicipaldoporto.pt" target="_blank" rel="noopener">18 set a 20 set ↗</a><span class="duracao-pill">termina em 47 dias</span>
+        <p class="event-desc">Espetáculo musical infantil no Campo Alegre</p>
+        <div class="card-actions card-actions--footer">
+          <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Quero+um+Piano&amp;dates=20260918%2F20260921&amp;details=Espet%C3%A1culo+musical+infantil+no+Campo+Alegre%0A%0Ahttps%3A%2F%2Fwww.teatromunicipaldoporto.pt&amp;location=Campo+Alegre+Caf%C3%A9-Teatro" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅 Calendar</a>
+          <button class="edit-btn" data-edit-event="s6t77bxwxonq" aria-label="Editar evento">✏️ Editar</button>
+          <button class="share-btn" data-share-event="s6t77bxwxonq" aria-label="Partilhar no WhatsApp">📲 Partilhar</button>
+          <button class="remove-btn" data-remove-event="s6t77bxwxonq" aria-label="Remover evento">🗑</button>
+        </div>
+      </div>
+    </article>
+  
+    <article class="event-card">
+      <div class="event-card-top">
+        <div>
+          <span class="type-tag" style="background:var(--accent-coral)">Música</span>
+          <h3 class="event-title">Viagem a Itália — Concerto para Famílias</h3>
+        </div>
+        <div class="event-card-top-right">
+          <div class="age-stamp"><b>4–14</b><small>anos</small></div>
+          <button class="fav-btn " data-fav-event="p47xk7txxonq" aria-label="Adicionar aos favoritos">☆</button>
+        </div>
+      </div>
+      <div class="event-card-body">
+        <div class="pill-row">
+          
+          
+          
+        </div>
+        <div class="event-meta-line"><b>Casa da Música</b></div>
+        <div class="event-meta-line">Sala Suggia</div>
+        <a class="schedule-chip schedule-chip--link" href="https://www.casadamusica.com" target="_blank" rel="noopener">Domingo, 20 set · 12:00 ↗</a><span class="duracao-pill">daqui a 47 dias</span>
+        <p class="event-desc">Orquestra Sinfónica em concerto pedagógico para famílias</p>
+        <div class="card-actions card-actions--footer">
+          <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Viagem+a+It%C3%A1lia+%E2%80%94+Concerto+para+Fam%C3%ADlias&amp;dates=20260920T120000%2F20260920T133000&amp;details=Orquestra+Sinf%C3%B3nica+em+concerto+pedag%C3%B3gico+para+fam%C3%ADlias%0A%0Ahttps%3A%2F%2Fwww.casadamusica.com&amp;location=Sala+Suggia" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅 Calendar</a>
+          <button class="edit-btn" data-edit-event="p47xk7txxonq" aria-label="Editar evento">✏️ Editar</button>
+          <button class="share-btn" data-share-event="p47xk7txxonq" aria-label="Partilhar no WhatsApp">📲 Partilhar</button>
+          <button class="remove-btn" data-remove-event="p47xk7txxonq" aria-label="Remover evento">🗑</button>
+        </div>
+      </div>
+    </article>
+  
+    <article class="event-card">
+      <div class="event-card-top">
+        <div>
+          <span class="type-tag" style="background:var(--accent-plum)">Teatro/Espetáculo</span>
+          <h3 class="event-title">O Som do Algodão — Trilogia AVES: VoAr</h3>
+        </div>
+        <div class="event-card-top-right">
+          <div class="age-stamp"><b>0–6</b><small>anos</small></div>
+          <button class="fav-btn " data-fav-event="1k7hp90lxonq" aria-label="Adicionar aos favoritos">☆</button>
+        </div>
+      </div>
+      <div class="event-card-body">
+        <div class="pill-row">
+          
+          
+          
+        </div>
+        <div class="event-meta-line"><b>Coliseu Porto Ageas</b></div>
+        <div class="event-meta-line">Salão Ático</div>
+        <a class="schedule-chip schedule-chip--link" href="https://www.coliseu.pt" target="_blank" rel="noopener">Segunda, 21 set · 10:30 ↗</a><span class="duracao-pill">daqui a 48 dias</span>
+        <p class="event-desc">Espetáculo de bebés e famílias sobre aves</p>
+        <div class="card-actions card-actions--footer">
+          <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=O+Som+do+Algod%C3%A3o+%E2%80%94+Trilogia+AVES%3A+VoAr&amp;dates=20260921T103000%2F20260921T120000&amp;details=Espet%C3%A1culo+de+beb%C3%A9s+e+fam%C3%ADlias+sobre+aves%0A%0Ahttps%3A%2F%2Fwww.coliseu.pt&amp;location=Sal%C3%A3o+%C3%81tico" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅 Calendar</a>
+          <button class="edit-btn" data-edit-event="1k7hp90lxonq" aria-label="Editar evento">✏️ Editar</button>
+          <button class="share-btn" data-share-event="1k7hp90lxonq" aria-label="Partilhar no WhatsApp">📲 Partilhar</button>
+          <button class="remove-btn" data-remove-event="1k7hp90lxonq" aria-label="Remover evento">🗑</button>
+        </div>
+      </div>
+    </article>
+  
+    <article class="event-card">
+      <div class="event-card-top">
+        <div>
+          <span class="type-tag" style="background:var(--accent-sage)">Ar livre</span>
+          <h3 class="event-title">Zoo Radical – Atrações de Verão</h3>
+        </div>
+        <div class="event-card-top-right">
+          <div class="age-stamp"><b>3–14</b><small>anos</small></div>
+          <button class="fav-btn " data-fav-event="4suughd8yf1d" aria-label="Adicionar aos favoritos">☆</button>
+        </div>
+      </div>
+      <div class="event-card-body">
+        <div class="pill-row">
+          
+          
+          
+        </div>
+        <div class="event-meta-line"><b>Zoo Santo Inácio</b></div>
+        <div class="event-meta-line">Zoo Santo Inácio, Vila Nova de Gaia</div>
+        <a class="schedule-chip schedule-chip--link" href="https://www.zoosantoinacio.com" target="_blank" rel="noopener">4 ago a 30 set · 10:00 ↗</a><span class="duracao-pill">termina em 57 dias</span>
+        <p class="event-desc">Montanha russa, bungee e carrossel ecológico no Zoo</p>
+        <div class="card-actions card-actions--footer">
+          <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Zoo+Radical+%E2%80%93+Atra%C3%A7%C3%B5es+de+Ver%C3%A3o&amp;dates=20260804T100000%2F20260804T113000&amp;details=Montanha+russa%2C+bungee+e+carrossel+ecol%C3%B3gico+no+Zoo%0A%0ANota%3A+pode+repetir-se+entre+2026-08-04+e+2026-09-30+%E2%80%94+confirma+no+site+oficial.%0A%0Ahttps%3A%2F%2Fwww.zoosantoinacio.com&amp;location=Zoo+Santo+In%C3%A1cio%2C+Vila+Nova+de+Gaia" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅 Calendar</a>
+          <button class="edit-btn" data-edit-event="4suughd8yf1d" aria-label="Editar evento">✏️ Editar</button>
+          <button class="share-btn" data-share-event="4suughd8yf1d" aria-label="Partilhar no WhatsApp">📲 Partilhar</button>
+          <button class="remove-btn" data-remove-event="4suughd8yf1d" aria-label="Remover evento">🗑</button>
+        </div>
+      </div>
+    </article>
+  
+    <article class="event-card">
+      <div class="event-card-top">
+        <div>
+          <span class="type-tag" style="background:var(--accent-plum)">Teatro/Espetáculo</span>
+          <h3 class="event-title">A Semana dos Porquês</h3>
+        </div>
+        <div class="event-card-top-right">
+          <div class="age-stamp"><b>5–14</b><small>anos</small></div>
+          <button class="fav-btn " data-fav-event="cwlhyu2nxonq" aria-label="Adicionar aos favoritos">☆</button>
+        </div>
+      </div>
+      <div class="event-card-body">
+        <div class="pill-row">
+          
+          
+          
+        </div>
+        <div class="event-meta-line"><b>Teatro Nacional São João</b></div>
+        
+        <a class="schedule-chip schedule-chip--link" href="https://www.tnsj.pt" target="_blank" rel="noopener">1 set a 30 set ↗</a><span class="duracao-pill">termina em 57 dias</span>
+        <p class="event-desc">Teatro infantil: revolta escolar por causa de brócolos</p>
+        <div class="card-actions card-actions--footer">
+          <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=A+Semana+dos+Porqu%C3%AAs&amp;dates=20260901%2F20261001&amp;details=Teatro+infantil%3A+revolta+escolar+por+causa+de+br%C3%B3colos%0A%0Ahttps%3A%2F%2Fwww.tnsj.pt&amp;location=Teatro+Nacional+S%C3%A3o+Jo%C3%A3o" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅 Calendar</a>
+          <button class="edit-btn" data-edit-event="cwlhyu2nxonq" aria-label="Editar evento">✏️ Editar</button>
+          <button class="share-btn" data-share-event="cwlhyu2nxonq" aria-label="Partilhar no WhatsApp">📲 Partilhar</button>
+          <button class="remove-btn" data-remove-event="cwlhyu2nxonq" aria-label="Remover evento">🗑</button>
+        </div>
+      </div>
+    </article>
+  
+    <article class="event-card">
+      <div class="event-card-top">
+        <div>
+          <span class="type-tag" style="background:var(--tile-blue-deep)">Exposição</span>
+          <h3 class="event-title">World of Discoveries — Museu Interativo</h3>
+        </div>
+        <div class="event-card-top-right">
+          <div class="age-stamp"><b>4–14</b><small>anos</small></div>
+          <button class="fav-btn " data-fav-event="yenh1om9z8mp" aria-label="Adicionar aos favoritos">☆</button>
+        </div>
+      </div>
+      <div class="event-card-body">
+        <div class="pill-row">
+          
+          
+          
+        </div>
+        <div class="event-meta-line"><b>World of Discoveries</b></div>
+        <div class="event-meta-line">Rua de Miragaia 106, Porto</div>
+        <a class="schedule-chip schedule-chip--link" href="https://www.worldofdiscoveries.com" target="_blank" rel="noopener">4 ago a 3 out · 10:00 ↗</a><span class="duracao-pill">termina em 60 dias</span>
+        <p class="event-desc">Museu imersivo sobre os Descobrimentos portugueses</p>
+        <div class="card-actions card-actions--footer">
+          <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=World+of+Discoveries+%E2%80%94+Museu+Interativo&amp;dates=20260804T100000%2F20260804T113000&amp;details=Museu+imersivo+sobre+os+Descobrimentos+portugueses%0A%0ANota%3A+pode+repetir-se+entre+2026-08-04+e+2026-10-03+%E2%80%94+confirma+no+site+oficial.%0A%0Ahttps%3A%2F%2Fwww.worldofdiscoveries.com&amp;location=Rua+de+Miragaia+106%2C+Porto" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅 Calendar</a>
+          <button class="edit-btn" data-edit-event="yenh1om9z8mp" aria-label="Editar evento">✏️ Editar</button>
+          <button class="share-btn" data-share-event="yenh1om9z8mp" aria-label="Partilhar no WhatsApp">📲 Partilhar</button>
+          <button class="remove-btn" data-remove-event="yenh1om9z8mp" aria-label="Remover evento">🗑</button>
+        </div>
+      </div>
+    </article>
+  
+    <article class="event-card">
+      <div class="event-card-top">
+        <div>
+          <span class="type-tag" style="background:var(--accent-coral)">Família/Diversos</span>
+          <h3 class="event-title">Nano Mino Micro – Programa para a Infância do Porto</h3>
+        </div>
+        <div class="event-card-top-right">
+          <div class="age-stamp"><b>0–12</b><small>anos</small></div>
+          <button class="fav-btn " data-fav-event="m5u38m1vyf1d" aria-label="Adicionar aos favoritos">☆</button>
+        </div>
+      </div>
+      <div class="event-card-body">
+        <div class="pill-row">
+          
+          
+          
+        </div>
+        <div class="event-meta-line"><b>Museu da Cidade do Porto</b></div>
+        <div class="event-meta-line">Biblioteca Municipal Almeida Garrett</div>
+        <a class="schedule-chip schedule-chip--link" href="https://museudoporto.pt/en/" target="_blank" rel="noopener">4 ago a 19 dez ↗</a><span class="duracao-pill">termina em 137 dias</span>
+        <p class="event-desc">Programa infantil continuado na Biblioteca Garrett</p>
+        <div class="card-actions card-actions--footer">
+          <a class="gcal-btn" href="https://calendar.google.com/calendar/render?action=TEMPLATE&amp;text=Nano+Mino+Micro+%E2%80%93+Programa+para+a+Inf%C3%A2ncia+do+Porto&amp;dates=20260804%2F20261220&amp;details=Programa+infantil+continuado+na+Biblioteca+Garrett%0A%0Ahttps%3A%2F%2Fmuseudoporto.pt%2Fen%2F&amp;location=Biblioteca+Municipal+Almeida+Garrett" target="_blank" rel="noopener" aria-label="Adicionar ao Google Calendar">📅 Calendar</a>
+          <button class="edit-btn" data-edit-event="m5u38m1vyf1d" aria-label="Editar evento">✏️ Editar</button>
+          <button class="share-btn" data-share-event="m5u38m1vyf1d" aria-label="Partilhar no WhatsApp">📲 Partilhar</button>
+          <button class="remove-btn" data-remove-event="m5u38m1vyf1d" aria-label="Remover evento">🗑</button>
+        </div>
+      </div>
+    </article>
+  </div>
+      <div id="emptyState" class="empty-state" hidden="">
         <b>Sem eventos com estes filtros</b>
         Tentem alargar a pesquisa, associar mais sites ou clicar em "Atualizar eventos".
       </div>
@@ -744,20 +1728,132 @@ button[disabled]{opacity:0.6; cursor:not-allowed;}
       <div class="results-header">
         <button class="sources-toggle" id="sourcesToggleBtn" aria-expanded="false">
           <span id="sourcesToggleLabel">▶ Gerir sites</span>
-          <span class="sources-count" id="sourcesCount"></span>
+          <span class="sources-count" id="sourcesCount">— 14 sites</span>
         </button>
-        <button class="btn-secondary" id="addSourceBtn" hidden>+ Associar site</button>
+        <button class="btn-secondary" id="addSourceBtn" hidden="">+ Associar site</button>
       </div>
-      <div id="sourcesBody" hidden>
+      <div id="sourcesBody" hidden="">
         <p class="hint-banner subtle">Estes são os sites consultados quando clicam em "Atualizar eventos". Associem os sites que a vossa família segue e removam os que já não interessam.</p>
-        <div id="sourcesList" class="sources-list"></div>
+        <div id="sourcesList" class="sources-list">
+    <div class="source-card">
+      <button class="remove-btn" data-remove-source="ryjojfbn7r4r" aria-label="Remover Bibliotecas Municipais do Porto">✕</button>
+      <span class="src-type">Biblioteca</span>
+      <span class="src-name">Bibliotecas Municipais do Porto</span>
+      <a href="https://bmp.cm-porto.pt" target="_blank" rel="noopener">https://bmp.cm-porto.pt</a>
+      <span class="src-timestamp">Pesquisado em 04/08/2026 às 20:29</span>
+      <span style="font-size:12.5px; color:var(--ink-soft);">Hora do conto e ateliês quase todos os sábados</span>
+    </div>
+    <div class="source-card">
+      <button class="remove-btn" data-remove-source="1ku3s0fz7r4r" aria-label="Remover Casa da Música">✕</button>
+      <span class="src-type">Sala de Espetáculos / Teatro</span>
+      <span class="src-name">Casa da Música</span>
+      <a href="https://www.casadamusica.com" target="_blank" rel="noopener">https://www.casadamusica.com</a>
+      <span class="src-timestamp">Pesquisado em 04/08/2026 às 20:29</span>
+      <span style="font-size:12.5px; color:var(--ink-soft);">Tem ciclo regular de concertos em família</span>
+    </div>
+    <div class="source-card">
+      <button class="remove-btn" data-remove-source="ef4tlu4v7r4r" aria-label="Remover Coliseu Porto Ageas">✕</button>
+      <span class="src-type">Sala de Espetáculos / Teatro</span>
+      <span class="src-name">Coliseu Porto Ageas</span>
+      <a href="https://www.coliseu.pt" target="_blank" rel="noopener">https://www.coliseu.pt</a>
+      <span class="src-timestamp">Pesquisado em 04/08/2026 às 20:29</span>
+      
+    </div>
+    <div class="source-card">
+      <button class="remove-btn" data-remove-source="5ba2tv137r4r" aria-label="Remover Teatro Nacional São João">✕</button>
+      <span class="src-type">Sala de Espetáculos / Teatro</span>
+      <span class="src-name">Teatro Nacional São João</span>
+      <a href="https://www.tnsj.pt" target="_blank" rel="noopener">https://www.tnsj.pt</a>
+      <span class="src-timestamp">Pesquisado em 04/08/2026 às 20:29</span>
+      
+    </div>
+    <div class="source-card">
+      <button class="remove-btn" data-remove-source="b5i86i367r4r" aria-label="Remover Teatro Municipal do Porto">✕</button>
+      <span class="src-type">Sala de Espetáculos / Teatro</span>
+      <span class="src-name">Teatro Municipal do Porto</span>
+      <a href="https://www.teatromunicipaldoporto.pt" target="_blank" rel="noopener">https://www.teatromunicipaldoporto.pt</a>
+      <span class="src-timestamp">Pesquisado em 04/08/2026 às 20:29</span>
+      <span style="font-size:12.5px; color:var(--ink-soft);">Rivoli e Campo Alegre</span>
+    </div>
+    <div class="source-card">
+      <button class="remove-btn" data-remove-source="mh20ig3g7r4r" aria-label="Remover Serralves">✕</button>
+      <span class="src-type">Espaço ao ar livre / Parque</span>
+      <span class="src-name">Serralves</span>
+      <a href="https://www.serralves.pt" target="_blank" rel="noopener">https://www.serralves.pt</a>
+      <span class="src-timestamp">Pesquisado em 04/08/2026 às 20:29</span>
+      <span style="font-size:12.5px; color:var(--ink-soft);">Programação em família ao fim de semana</span>
+    </div>
+    <div class="source-card">
+      <button class="remove-btn" data-remove-source="m63ojl0i7r4r" aria-label="Remover Museu da Cidade do Porto">✕</button>
+      <span class="src-type">Museu</span>
+      <span class="src-name">Museu da Cidade do Porto</span>
+      <a href="https://museudoporto.pt" target="_blank" rel="noopener">https://museudoporto.pt</a>
+      <span class="src-timestamp">Pesquisado em 04/08/2026 às 20:29</span>
+      
+    </div>
+    <div class="source-card">
+      <button class="remove-btn" data-remove-source="dkv9rls57r4r" aria-label="Remover Balleteatro">✕</button>
+      <span class="src-type">Sala de Espetáculos / Teatro</span>
+      <span class="src-name">Balleteatro</span>
+      <a href="https://www.balleteatro.pt" target="_blank" rel="noopener">https://www.balleteatro.pt</a>
+      <span class="src-timestamp">Pesquisado em 04/08/2026 às 20:29</span>
+      <span style="font-size:12.5px; color:var(--ink-soft);">Oficinas para bebés e pequenos</span>
+    </div>
+    <div class="source-card">
+      <button class="remove-btn" data-remove-source="30oaxtu27r4r" aria-label="Remover Zoo Santo Inácio">✕</button>
+      <span class="src-type">Espaço ao ar livre / Parque</span>
+      <span class="src-name">Zoo Santo Inácio</span>
+      <a href="https://www.zoosantoinacio.com" target="_blank" rel="noopener">https://www.zoosantoinacio.com</a>
+      <span class="src-timestamp">Pesquisado em 04/08/2026 às 20:29</span>
+      <span style="font-size:12.5px; color:var(--ink-soft);">Atração permanente — confirmar horários sazonais</span>
+    </div>
+    <div class="source-card">
+      <button class="remove-btn" data-remove-source="is09797y7r4s" aria-label="Remover SEA LIFE Porto">✕</button>
+      <span class="src-type">Museu</span>
+      <span class="src-name">SEA LIFE Porto</span>
+      <a href="https://www.visitsealife.com/porto/" target="_blank" rel="noopener">https://www.visitsealife.com/porto/</a>
+      <span class="src-timestamp">Pesquisado em 04/08/2026 às 20:29</span>
+      <span style="font-size:12.5px; color:var(--ink-soft);">Atração permanente, mas tem exposições e eventos temporários</span>
+    </div>
+    <div class="source-card">
+      <button class="remove-btn" data-remove-source="73guod6b7r4s" aria-label="Remover World of Discoveries">✕</button>
+      <span class="src-type">Museu</span>
+      <span class="src-name">World of Discoveries</span>
+      <a href="https://www.worldofdiscoveries.com" target="_blank" rel="noopener">https://www.worldofdiscoveries.com</a>
+      <span class="src-timestamp">Pesquisado em 04/08/2026 às 20:30</span>
+      <span style="font-size:12.5px; color:var(--ink-soft);">Atração permanente</span>
+    </div>
+    <div class="source-card">
+      <button class="remove-btn" data-remove-source="j6lwv0nn7r4s" aria-label="Remover iPorto — Agenda Metropolitana da Cultura">✕</button>
+      <span class="src-type">Agregador de eventos</span>
+      <span class="src-name">iPorto — Agenda Metropolitana da Cultura</span>
+      <a href="https://iporto.amp.pt" target="_blank" rel="noopener">https://iporto.amp.pt</a>
+      <span class="src-timestamp">Pesquisado em 04/08/2026 às 20:30</span>
+      <span style="font-size:12.5px; color:var(--ink-soft);">Junta eventos de toda a área metropolitana, com filtro "Infantil e Juvenil"</span>
+    </div>
+    <div class="source-card">
+      <button class="remove-btn" data-remove-source="0bkk05gl7r4s" aria-label="Remover Viral Agenda — Porto Kids">✕</button>
+      <span class="src-type">Agregador de eventos</span>
+      <span class="src-name">Viral Agenda — Porto Kids</span>
+      <a href="https://www.viralagenda.com/pt/porto/kids" target="_blank" rel="noopener">https://www.viralagenda.com/pt/porto/kids</a>
+      <span class="src-timestamp">Pesquisado em 04/08/2026 às 20:30</span>
+      
+    </div>
+    <div class="source-card">
+      <button class="remove-btn" data-remove-source="ydmdk76q7r4s" aria-label="Remover Pumpkin.pt — Agenda Família">✕</button>
+      <span class="src-type">Agregador de eventos</span>
+      <span class="src-name">Pumpkin.pt — Agenda Família</span>
+      <a href="https://pumpkin.pt/agenda/" target="_blank" rel="noopener">https://pumpkin.pt/agenda/</a>
+      <span class="src-timestamp">Pesquisado em 04/08/2026 às 20:30</span>
+      
+    </div></div>
       </div>
     </section>
   </main>
 
   <footer class="page-footer">
     Os vossos dados ficam guardados na vossa conta, só para esta família.
-    <button class="link-btn" id="exportBtn">⬇️ Exportar com dados</button>
+    <button class="link-btn" id="exportBtn" disabled="">⏳ A preparar…</button>
     <button class="link-btn" id="clearExamplesBtn">Limpar exemplos</button>
     <span class="version-stamp">🕓 02/07/2026, 12:54 (UTC)</span>
   </footer>
@@ -765,7 +1861,7 @@ button[disabled]{opacity:0.6; cursor:not-allowed;}
 
 <!-- Add Source Modal -->
 <!-- Calendar Modal -->
-<div class="modal-overlay" id="calendarModalOverlay" hidden>
+<div class="modal-overlay" id="calendarModalOverlay" hidden="">
   <div class="modal modal--wide" role="dialog" aria-modal="true" aria-labelledby="calendarModalTitle">
     <div class="cal-header">
       <h3 id="calendarModalTitle">Calendário de eventos</h3>
@@ -786,53 +1882,53 @@ button[disabled]{opacity:0.6; cursor:not-allowed;}
 </div>
 
 <!-- Edit Event Modal -->
-<div class="modal-overlay" id="editModalOverlay" hidden>
+<div class="modal-overlay" id="editModalOverlay" hidden="">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="editModalTitle">
     <h3 id="editModalTitle">Editar evento</h3>
     <form id="editForm">
       <div class="form-field">
         <label for="edit_titulo">Nome do evento *</label>
-        <input type="text" id="edit_titulo" required />
+        <input type="text" id="edit_titulo" required="">
       </div>
       <div class="form-row">
         <div class="form-field">
           <label for="edit_fonte">Site / local associado *</label>
-          <input type="text" id="edit_fonte" list="editFonteList" required placeholder="ex: Casa da Música" />
-          <datalist id="editFonteList"></datalist>
+          <input type="text" id="edit_fonte" list="editFonteList" required="" placeholder="ex: Casa da Música">
+          <datalist id="editFonteList"><option value="Balleteatro"></option><option value="Bibliotecas Municipais do Porto"></option><option value="Casa da Música"></option><option value="Coliseu Porto Ageas"></option><option value="iPorto — Agenda Metropolitana da Cultura"></option><option value="Museu da Cidade do Porto"></option><option value="Pumpkin.pt — Agenda Família"></option><option value="SEA LIFE Porto"></option><option value="Serralves"></option><option value="Teatro Municipal do Porto"></option><option value="Teatro Nacional São João"></option><option value="Viral Agenda — Porto Kids"></option><option value="World of Discoveries"></option><option value="Zoo Santo Inácio"></option></datalist>
         </div>
         <div class="form-field">
           <label for="edit_tipo">Tipo *</label>
-          <select id="edit_tipo"></select>
+          <select id="edit_tipo"><option value="Literatura">Literatura</option><option value="Workshop/Oficina">Workshop/Oficina</option><option value="Música">Música</option><option value="Teatro/Espetáculo">Teatro/Espetáculo</option><option value="Exposição">Exposição</option><option value="Ar livre">Ar livre</option><option value="Família/Diversos">Família/Diversos</option><option value="Cinema">Cinema</option><option value="Outro">Outro</option></select>
         </div>
       </div>
       <div class="form-field">
         <label for="edit_local">Local exato (opcional)</label>
-        <input type="text" id="edit_local" placeholder="ex: Sala Ensaio 2" />
+        <input type="text" id="edit_local" placeholder="ex: Sala Ensaio 2">
       </div>
       <div class="form-row">
         <div class="form-field">
           <label for="edit_idademin">Idade mínima</label>
-          <input type="number" id="edit_idademin" min="0" max="18" />
+          <input type="number" id="edit_idademin" min="0" max="18">
         </div>
         <div class="form-field">
           <label for="edit_idademax">Idade máxima</label>
-          <input type="number" id="edit_idademax" min="0" max="18" />
+          <input type="number" id="edit_idademax" min="0" max="18">
         </div>
       </div>
       <div class="form-row">
         <div class="form-field">
           <label for="edit_data">Data *</label>
-          <input type="date" id="edit_data" required />
+          <input type="date" id="edit_data" required="">
         </div>
         <div class="form-field">
           <label for="edit_datafim">Data de fim (opcional)</label>
-          <input type="date" id="edit_datafim" />
+          <input type="date" id="edit_datafim">
         </div>
       </div>
       <div class="form-row">
         <div class="form-field">
           <label for="edit_hora">Hora (opcional)</label>
-          <input type="text" id="edit_hora" placeholder="ex: 11:00" />
+          <input type="text" id="edit_hora" placeholder="ex: 11:00">
         </div>
         <div class="form-field">
           <label for="edit_gratuito">Custo</label>
@@ -845,7 +1941,7 @@ button[disabled]{opacity:0.6; cursor:not-allowed;}
       </div>
       <div class="form-field">
         <label for="edit_link">Link (opcional)</label>
-        <input type="url" id="edit_link" placeholder="https://…" />
+        <input type="url" id="edit_link" placeholder="https://…">
       </div>
       <div class="form-field">
         <label for="edit_desc">Descrição (opcional)</label>
@@ -859,25 +1955,25 @@ button[disabled]{opacity:0.6; cursor:not-allowed;}
   </div>
 </div>
 
-<div class="modal-overlay" id="sourceModalOverlay" hidden>
+<div class="modal-overlay" id="sourceModalOverlay" hidden="">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="sourceModalTitle">
     <h3 id="sourceModalTitle">Associar site</h3>
     <form id="sourceForm">
       <div class="form-field">
         <label for="src_nome">Nome do site / local *</label>
-        <input type="text" id="src_nome" required placeholder="ex: Biblioteca Municipal Almeida Garrett" />
+        <input type="text" id="src_nome" required="" placeholder="ex: Biblioteca Municipal Almeida Garrett">
       </div>
       <div class="form-field">
         <label for="src_url">Endereço (URL) *</label>
-        <input type="url" id="src_url" required placeholder="https://…" />
+        <input type="url" id="src_url" required="" placeholder="https://…">
       </div>
       <div class="form-field">
         <label for="src_tipo">Tipo de local</label>
-        <select id="src_tipo"></select>
+        <select id="src_tipo"><option value="Biblioteca">Biblioteca</option><option value="Sala de Espetáculos / Teatro">Sala de Espetáculos / Teatro</option><option value="Museu">Museu</option><option value="Espaço ao ar livre / Parque">Espaço ao ar livre / Parque</option><option value="Centro de Ciência">Centro de Ciência</option><option value="Centro Comercial">Centro Comercial</option><option value="Agregador de eventos">Agregador de eventos</option><option value="Outro">Outro</option></select>
       </div>
       <div class="form-field">
         <label for="src_nota">Nota (opcional)</label>
-        <input type="text" id="src_nota" placeholder="ex: agenda atualizada todas as 4ªs feiras" />
+        <input type="text" id="src_nota" placeholder="ex: agenda atualizada todas as 4ªs feiras">
       </div>
       <div class="modal-actions">
         <button type="button" class="btn-ghost" id="cancelSourceBtn">Cancelar</button>
@@ -890,9 +1986,424 @@ button[disabled]{opacity:0.6; cursor:not-allowed;}
 
 
 <script>
-// SNAPSHOT_DATA é null quando a agenda corre online (dados vêm de eventos.json).
-// Quando exportada com dados embutidos, contém todos os dados para modo offline.
-const SNAPSHOT_DATA = null;
+// SNAPSHOT_DATA é null quando a agenda corre online (dados vêm do storage).
+// Quando é exportada com dados embutidos, esta constante contém todos os dados
+// e a agenda funciona completamente offline, em qualquer browser, sem login.
+const SNAPSHOT_DATA = {
+  "exportadoEm": "2026-08-04T19:30:53.804Z",
+  "eventos": [
+    {
+      "id": "fo43arc4xonq",
+      "titulo": "Sábados a Contar — Hora do Conto",
+      "fonte": "Bibliotecas Municipais do Porto",
+      "local": "Biblioteca Municipal Almeida Garrett",
+      "tipo": "Literatura",
+      "idadeMin": 3,
+      "idadeMax": 10,
+      "dataInicio": "2026-08-09",
+      "dataFim": "",
+      "hora": "11:00",
+      "gratuito": true,
+      "link": "https://bmp.cm-porto.pt/pesquisar-eventos-sc",
+      "descricao": "Hora do conto e atelier para famílias",
+      "isExample": false,
+      "isAuto": true
+    },
+    {
+      "id": "1k7hp90lxonq",
+      "titulo": "O Som do Algodão — Trilogia AVES: VoAr",
+      "fonte": "Coliseu Porto Ageas",
+      "local": "Salão Ático",
+      "tipo": "Teatro/Espetáculo",
+      "idadeMin": 0,
+      "idadeMax": 6,
+      "dataInicio": "2026-09-21",
+      "dataFim": "",
+      "hora": "10:30",
+      "gratuito": false,
+      "link": "https://www.coliseu.pt",
+      "descricao": "Espetáculo de bebés e famílias sobre aves",
+      "isExample": false,
+      "isAuto": true
+    },
+    {
+      "id": "p47xk7txxonq",
+      "titulo": "Viagem a Itália — Concerto para Famílias",
+      "fonte": "Casa da Música",
+      "local": "Sala Suggia",
+      "tipo": "Música",
+      "idadeMin": 4,
+      "idadeMax": 14,
+      "dataInicio": "2026-09-20",
+      "dataFim": "",
+      "hora": "12:00",
+      "gratuito": false,
+      "link": "https://www.casadamusica.com",
+      "descricao": "Orquestra Sinfónica em concerto pedagógico para famílias",
+      "isExample": false,
+      "isAuto": true
+    },
+    {
+      "id": "cwlhyu2nxonq",
+      "titulo": "A Semana dos Porquês",
+      "fonte": "Teatro Nacional São João",
+      "local": "",
+      "tipo": "Teatro/Espetáculo",
+      "idadeMin": 5,
+      "idadeMax": 14,
+      "dataInicio": "2026-09-01",
+      "dataFim": "2026-09-30",
+      "hora": "",
+      "gratuito": false,
+      "link": "https://www.tnsj.pt",
+      "descricao": "Teatro infantil: revolta escolar por causa de brócolos",
+      "isExample": false,
+      "isAuto": true
+    },
+    {
+      "id": "ch6p6rhcxonq",
+      "titulo": "Quebra-Cabeças — espetáculo para escolas e famílias",
+      "fonte": "Teatro Municipal do Porto",
+      "local": "Campo Alegre Exterior",
+      "tipo": "Teatro/Espetáculo",
+      "idadeMin": 3,
+      "idadeMax": 12,
+      "dataInicio": "2026-09-05",
+      "dataFim": "2026-09-06",
+      "hora": "10:30",
+      "gratuito": false,
+      "link": "https://www.teatromunicipaldoporto.pt",
+      "descricao": "Espetáculo ao ar livre para crianças e escolas",
+      "isExample": false,
+      "isAuto": true
+    },
+    {
+      "id": "s6t77bxwxonq",
+      "titulo": "Quero um Piano",
+      "fonte": "Teatro Municipal do Porto",
+      "local": "Campo Alegre Café-Teatro",
+      "tipo": "Teatro/Espetáculo",
+      "idadeMin": 4,
+      "idadeMax": 12,
+      "dataInicio": "2026-09-18",
+      "dataFim": "2026-09-20",
+      "hora": "",
+      "gratuito": false,
+      "link": "https://www.teatromunicipaldoporto.pt",
+      "descricao": "Espetáculo musical infantil no Campo Alegre",
+      "isExample": false,
+      "isAuto": true
+    },
+    {
+      "id": "fqtbk5noyf1d",
+      "titulo": "Oficina de Famílias | Charcos de Serralves",
+      "fonte": "Serralves",
+      "local": "Parque",
+      "tipo": "Workshop/Oficina",
+      "idadeMin": 0,
+      "idadeMax": 14,
+      "dataInicio": "2026-08-04",
+      "dataFim": "2026-08-28",
+      "hora": "11:00",
+      "gratuito": null,
+      "link": "https://www.serralves.pt/en/atividades-serralves/1307-oficina-charcos-de-serralves/",
+      "descricao": "Exploração multissensorial de charcos no Parque",
+      "isExample": false,
+      "isAuto": true
+    },
+    {
+      "id": "rz5d91pbyf1d",
+      "titulo": "Oficina de Famílias | Casa: Estufa",
+      "fonte": "Serralves",
+      "local": "Parque",
+      "tipo": "Workshop/Oficina",
+      "idadeMin": 0,
+      "idadeMax": 14,
+      "dataInicio": "2026-08-22",
+      "dataFim": "",
+      "hora": "11:00",
+      "gratuito": null,
+      "link": "https://www.serralves.pt/en/",
+      "descricao": "Oficina familiar sobre a estufa do Parque",
+      "isExample": false,
+      "isAuto": true
+    },
+    {
+      "id": "r6kv67dvyf1d",
+      "titulo": "Astronomia no Parque",
+      "fonte": "Serralves",
+      "local": "Clareira dos Teixos",
+      "tipo": "Ar livre",
+      "idadeMin": 0,
+      "idadeMax": 14,
+      "dataInicio": "2026-08-21",
+      "dataFim": "2026-09-07",
+      "hora": "21:30",
+      "gratuito": null,
+      "link": "https://www.serralves.pt/en/",
+      "descricao": "Noites de astronomia ao ar livre em família",
+      "isExample": false,
+      "isAuto": true
+    },
+    {
+      "id": "m5u38m1vyf1d",
+      "titulo": "Nano Mino Micro – Programa para a Infância do Porto",
+      "fonte": "Museu da Cidade do Porto",
+      "local": "Biblioteca Municipal Almeida Garrett",
+      "tipo": "Família/Diversos",
+      "idadeMin": 0,
+      "idadeMax": 12,
+      "dataInicio": "2026-08-04",
+      "dataFim": "2026-12-19",
+      "hora": "",
+      "gratuito": null,
+      "link": "https://museudoporto.pt/en/",
+      "descricao": "Programa infantil continuado na Biblioteca Garrett",
+      "isExample": false,
+      "isAuto": true
+    },
+    {
+      "id": "4suughd8yf1d",
+      "titulo": "Zoo Radical – Atrações de Verão",
+      "fonte": "Zoo Santo Inácio",
+      "local": "Zoo Santo Inácio, Vila Nova de Gaia",
+      "tipo": "Ar livre",
+      "idadeMin": 3,
+      "idadeMax": 14,
+      "dataInicio": "2026-08-04",
+      "dataFim": "2026-09-30",
+      "hora": "10:00",
+      "gratuito": false,
+      "link": "https://www.zoosantoinacio.com",
+      "descricao": "Montanha russa, bungee e carrossel ecológico no Zoo",
+      "isExample": false,
+      "isAuto": true
+    },
+    {
+      "id": "m1a6ms6qz8mp",
+      "titulo": "Vizinhanças — Domingos em família no Porto",
+      "fonte": "Pumpkin.pt — Agenda Família",
+      "local": "Vários espaços públicos do Porto",
+      "tipo": "Ar livre",
+      "idadeMin": 0,
+      "idadeMax": 14,
+      "dataInicio": "2026-08-09",
+      "dataFim": "2026-08-30",
+      "hora": "10:00",
+      "gratuito": true,
+      "link": "https://pumpkin.pt/eventos/vizinhancas-no-porto/",
+      "descricao": "Teatro, circo, música e oficinas ao ar livre",
+      "isExample": false,
+      "isAuto": true
+    },
+    {
+      "id": "75gorl56z8mp",
+      "titulo": "Oficina de Famílias — Charcos de Serralves",
+      "fonte": "iPorto — Agenda Metropolitana da Cultura",
+      "local": "Parque de Serralves",
+      "tipo": "Workshop/Oficina",
+      "idadeMin": 0,
+      "idadeMax": 14,
+      "dataInicio": "2026-08-09",
+      "dataFim": "",
+      "hora": "11:00",
+      "gratuito": false,
+      "link": "https://iporto.amp.pt",
+      "descricao": "Exploração multissensorial dos charcos do parque",
+      "isExample": false,
+      "isAuto": true
+    },
+    {
+      "id": "zqubgp1hz8mp",
+      "titulo": "Festival de Verão SEA LIFE Porto",
+      "fonte": "Pumpkin.pt — Agenda Família",
+      "local": "SEA LIFE Porto",
+      "tipo": "Família/Diversos",
+      "idadeMin": 2,
+      "idadeMax": 14,
+      "dataInicio": "2026-08-04",
+      "dataFim": "2026-08-09",
+      "hora": "",
+      "gratuito": false,
+      "link": "https://pumpkin.pt/agenda/",
+      "descricao": "Piratas, pedras e pinguins no aquário do Porto",
+      "isExample": false,
+      "isAuto": true
+    },
+    {
+      "id": "o7qxhkbcz8mp",
+      "titulo": "Feira do Livro do Porto 2026",
+      "fonte": "Pumpkin.pt — Agenda Família",
+      "local": "Jardins do Palácio de Cristal",
+      "tipo": "Literatura",
+      "idadeMin": 0,
+      "idadeMax": 14,
+      "dataInicio": "2026-08-21",
+      "dataFim": "2026-09-06",
+      "hora": "11:00",
+      "gratuito": true,
+      "link": "https://pumpkin.pt/agenda/",
+      "descricao": "Literatura infantil e atividades gratuitas para famílias",
+      "isExample": false,
+      "isAuto": true
+    },
+    {
+      "id": "xgu29uipz8mp",
+      "titulo": "Oficina de Famílias — Casa: Estufa (Serralves)",
+      "fonte": "iPorto — Agenda Metropolitana da Cultura",
+      "local": "Parque de Serralves",
+      "tipo": "Workshop/Oficina",
+      "idadeMin": 0,
+      "idadeMax": 14,
+      "dataInicio": "2026-08-23",
+      "dataFim": "",
+      "hora": "11:00",
+      "gratuito": false,
+      "link": "https://iporto.amp.pt",
+      "descricao": "Visita interativa às estufas do parque",
+      "isExample": false,
+      "isAuto": true
+    },
+    {
+      "id": "yenh1om9z8mp",
+      "titulo": "World of Discoveries — Museu Interativo",
+      "fonte": "World of Discoveries",
+      "local": "Rua de Miragaia 106, Porto",
+      "tipo": "Exposição",
+      "idadeMin": 4,
+      "idadeMax": 14,
+      "dataInicio": "2026-08-04",
+      "dataFim": "2026-10-03",
+      "hora": "10:00",
+      "gratuito": false,
+      "link": "https://www.worldofdiscoveries.com",
+      "descricao": "Museu imersivo sobre os Descobrimentos portugueses",
+      "isExample": false,
+      "isAuto": true
+    }
+  ],
+  "fontes": [
+    {
+      "ultimaAtualizacao": "2026-08-04T19:29:20.926Z",
+      "id": "ryjojfbn7r4r",
+      "nome": "Bibliotecas Municipais do Porto",
+      "url": "https://bmp.cm-porto.pt",
+      "tipoLocal": "Biblioteca",
+      "nota": "Hora do conto e ateliês quase todos os sábados"
+    },
+    {
+      "ultimaAtualizacao": "2026-08-04T19:29:20.926Z",
+      "id": "1ku3s0fz7r4r",
+      "nome": "Casa da Música",
+      "url": "https://www.casadamusica.com",
+      "tipoLocal": "Sala de Espetáculos / Teatro",
+      "nota": "Tem ciclo regular de concertos em família"
+    },
+    {
+      "ultimaAtualizacao": "2026-08-04T19:29:20.926Z",
+      "id": "ef4tlu4v7r4r",
+      "nome": "Coliseu Porto Ageas",
+      "url": "https://www.coliseu.pt",
+      "tipoLocal": "Sala de Espetáculos / Teatro",
+      "nota": ""
+    },
+    {
+      "ultimaAtualizacao": "2026-08-04T19:29:20.926Z",
+      "id": "5ba2tv137r4r",
+      "nome": "Teatro Nacional São João",
+      "url": "https://www.tnsj.pt",
+      "tipoLocal": "Sala de Espetáculos / Teatro",
+      "nota": ""
+    },
+    {
+      "ultimaAtualizacao": "2026-08-04T19:29:20.926Z",
+      "id": "b5i86i367r4r",
+      "nome": "Teatro Municipal do Porto",
+      "url": "https://www.teatromunicipaldoporto.pt",
+      "tipoLocal": "Sala de Espetáculos / Teatro",
+      "nota": "Rivoli e Campo Alegre"
+    },
+    {
+      "ultimaAtualizacao": "2026-08-04T19:29:54.985Z",
+      "id": "mh20ig3g7r4r",
+      "nome": "Serralves",
+      "url": "https://www.serralves.pt",
+      "tipoLocal": "Espaço ao ar livre / Parque",
+      "nota": "Programação em família ao fim de semana"
+    },
+    {
+      "ultimaAtualizacao": "2026-08-04T19:29:54.985Z",
+      "id": "m63ojl0i7r4r",
+      "nome": "Museu da Cidade do Porto",
+      "url": "https://museudoporto.pt",
+      "tipoLocal": "Museu",
+      "nota": ""
+    },
+    {
+      "ultimaAtualizacao": "2026-08-04T19:29:54.985Z",
+      "id": "dkv9rls57r4r",
+      "nome": "Balleteatro",
+      "url": "https://www.balleteatro.pt",
+      "tipoLocal": "Sala de Espetáculos / Teatro",
+      "nota": "Oficinas para bebés e pequenos"
+    },
+    {
+      "ultimaAtualizacao": "2026-08-04T19:29:54.985Z",
+      "id": "30oaxtu27r4r",
+      "nome": "Zoo Santo Inácio",
+      "url": "https://www.zoosantoinacio.com",
+      "tipoLocal": "Espaço ao ar livre / Parque",
+      "nota": "Atração permanente — confirmar horários sazonais"
+    },
+    {
+      "ultimaAtualizacao": "2026-08-04T19:29:54.985Z",
+      "id": "is09797y7r4s",
+      "nome": "SEA LIFE Porto",
+      "url": "https://www.visitsealife.com/porto/",
+      "tipoLocal": "Museu",
+      "nota": "Atração permanente, mas tem exposições e eventos temporários"
+    },
+    {
+      "ultimaAtualizacao": "2026-08-04T19:30:33.232Z",
+      "id": "73guod6b7r4s",
+      "nome": "World of Discoveries",
+      "url": "https://www.worldofdiscoveries.com",
+      "tipoLocal": "Museu",
+      "nota": "Atração permanente"
+    },
+    {
+      "ultimaAtualizacao": "2026-08-04T19:30:33.232Z",
+      "id": "j6lwv0nn7r4s",
+      "nome": "iPorto — Agenda Metropolitana da Cultura",
+      "url": "https://iporto.amp.pt",
+      "tipoLocal": "Agregador de eventos",
+      "nota": "Junta eventos de toda a área metropolitana, com filtro \"Infantil e Juvenil\""
+    },
+    {
+      "ultimaAtualizacao": "2026-08-04T19:30:33.232Z",
+      "id": "0bkk05gl7r4s",
+      "nome": "Viral Agenda — Porto Kids",
+      "url": "https://www.viralagenda.com/pt/porto/kids",
+      "tipoLocal": "Agregador de eventos",
+      "nota": ""
+    },
+    {
+      "ultimaAtualizacao": "2026-08-04T19:30:33.232Z",
+      "id": "ydmdk76q7r4s",
+      "nome": "Pumpkin.pt — Agenda Família",
+      "url": "https://pumpkin.pt/agenda/",
+      "tipoLocal": "Agregador de eventos",
+      "nota": ""
+    }
+  ],
+  "ultimaAtualizacao": {
+    "quando": "2026-08-04T19:30:34.774Z",
+    "total": 17,
+    "sucesso": true,
+    "incompleta": false,
+    "lotesComFalha": 0
+  }
+};
 
 const TYPES = ['Literatura','Workshop/Oficina','Música','Teatro/Espetáculo','Exposição','Ar livre','Família/Diversos','Cinema','Outro'];
 const TYPE_COLORS = {
@@ -908,18 +2419,9 @@ const TYPE_COLORS = {
 };
 const LOCAL_TYPES = ['Biblioteca','Sala de Espetáculos / Teatro','Museu','Espaço ao ar livre / Parque','Centro de Ciência','Centro Comercial','Agregador de eventos','Outro'];
 
-// Chaves de localStorage (dados do utilizador — persistem entre sessões)
-const LS_FAVORITOS        = 'agenda-porto:favoritos';        // chaves estáveis título|data
-const LS_EVENTOS_EXTRAS   = 'agenda-porto:eventosExtras';    // eventos manuais/editados
-const LS_FONTES_EXTRAS    = 'agenda-porto:fontesExtras';     // fontes adicionadas via UI
-const LS_FONTES_REMOVIDAS = 'agenda-porto:fontesRemovidas';  // IDs removidos de fontes.json
-const LS_EVENTOS_OCULTOS  = 'agenda-porto:eventosOcultos';  // chaves estáveis de eventos removidos
-
-function lsGet(key){ try{ return JSON.parse(localStorage.getItem(key)); }catch(e){ return null; } }
-function lsSet(key, value){ try{ localStorage.setItem(key, JSON.stringify(value)); }catch(e){ console.error('localStorage error:', e); } }
-
-// Chave estável para favoritos e eventos ocultos (sobrevive a refrescos)
-function chavEstavel(ev){ return (ev.titulo||'').trim().toLowerCase() + '|' + ev.dataInicio; }
+const EVENTS_KEY = 'agenda-pequenos:eventos';
+const SOURCES_KEY = 'agenda-pequenos:fontes';
+const LASTREFRESH_KEY = 'agenda-pequenos:ultimaAtualizacao';
 
 function uid(){ return Math.random().toString(36).slice(2,10) + Date.now().toString(36).slice(-4); }
 
@@ -969,79 +2471,84 @@ let diaSelecionadoCalendario = null;
 let filters = {search:'', age:'todas', cost:'todas', type:'todas', source:'todas', quando:'todas', favoritos:false};
 
 
-// Funções de storage no-op — mantidas por compatibilidade com a lógica de edição/remoção.
-// Os dados reais do utilizador são geridos via localStorage (lsGet/lsSet).
-async function storageGet(key){ return null; }
-async function storageSet(key, value){ return true; }
-async function storageDelete(key){ return true; }
+// Armazenamento PESSOAL: só quem está autenticado com a tua conta vê e altera
+// estes dados (sites, eventos, edições, estado da última atualização). Mantido
+// assim de propósito até validares a fiabilidade dos dados no dia a dia —
+// mudar para partilhado é só trocar "false" por "true" nas 3 chamadas abaixo.
+// Quando window.storage não existe (ficheiro offline), as operações são no-op.
+async function storageGet(key){
+  try{
+    if(!window.storage) return null;
+    const res = await window.storage.get(key, false);
+    return res ? JSON.parse(res.value) : null;
+  }catch(e){
+    return null;
+  }
+}
+async function storageSet(key, value){
+  try{
+    if(!window.storage) return true; // offline: dados só em memória
+    await window.storage.set(key, JSON.stringify(value), false);
+    return true;
+  }catch(e){
+    console.error('Falha ao guardar', key, e);
+    return false;
+  }
+}
+async function storageDelete(key){
+  try{
+    if(!window.storage) return true;
+    await window.storage.delete(key, false);
+    return true;
+  }catch(e){
+    return false;
+  }
+}
 
 async function init(){
   document.getElementById('resultsCount').textContent = 'A carregar…';
 
-  // ── Modo offline: SNAPSHOT_DATA embutido no ficheiro exportado ────────────
+  // Modo offline (ficheiro com dados embutidos) — SNAPSHOT_DATA não é null.
   if(SNAPSHOT_DATA !== null){
-    allEvents = (SNAPSHOT_DATA.eventos || []).map(applyFavorites);
-    allSources = mergeSourcesFromSnapshot(SNAPSHOT_DATA.fontes || []);
+    allEvents = SNAPSHOT_DATA.eventos || [];
+    allSources = (SNAPSHOT_DATA.fontes || []).map(s => ({ultimaAtualizacao: null, ...s}));
     buildStaticSelects();
     renderAll();
     wireEvents();
     const banner = document.getElementById('topStatusBanner');
     const meta = document.getElementById('refreshMeta');
     const quando = SNAPSHOT_DATA.exportadoEm
-      ? new Date(SNAPSHOT_DATA.exportadoEm).toLocaleDateString('pt-PT') + ' às '
-        + new Date(SNAPSHOT_DATA.exportadoEm).toLocaleTimeString('pt-PT',{hour:'2-digit',minute:'2-digit'})
+      ? new Date(SNAPSHOT_DATA.exportadoEm).toLocaleDateString('pt-PT') + ' às ' + new Date(SNAPSHOT_DATA.exportadoEm).toLocaleTimeString('pt-PT', {hour:'2-digit', minute:'2-digit'})
       : 'data desconhecida';
     banner.className = 'status-banner status-banner--info';
-    banner.textContent = `📋 Snapshot exportado em ${quando}. Abre a agenda online para ver a versão mais recente.`;
-    meta.textContent = `Snapshot de ${quando} — ${allEvents.length} eventos.`;
+    banner.textContent = `📋 Snapshot exportado em ${quando}. Os dados estão embutidos neste ficheiro — abre a agenda online para atualizar.`;
+    meta.textContent = `Snapshot de ${quando} — ${allEvents.length} eventos, ${allSources.length} sites.`;
     return;
   }
 
-  // ── Modo online: carrega de eventos.json e fontes.json ────────────────────
-  const [evData, fontesList] = await Promise.all([
-    fetch('eventos.json').then(r=>r.ok?r.json():null).catch(()=>null),
-    fetch('fontes.json').then(r=>r.ok?r.json():null).catch(()=>null)
-  ]);
+  // Modo online — dados vêm do storage da conta Claude.
+  const [storedEvents, storedSources] = await Promise.all([storageGet(EVENTS_KEY), storageGet(SOURCES_KEY)]);
 
-  // Eventos automáticos do servidor + ocultos pelo utilizador + extras manuais
-  const ocultos = new Set(lsGet(LS_EVENTOS_OCULTOS)||[]);
-  const autoEvents = ((evData&&evData.eventos)||[])
-    .filter(ev=>!ocultos.has(chavEstavel(ev)))
-    .map(applyFavorites);
-  const extrasEvents = (lsGet(LS_EVENTOS_EXTRAS)||[]).map(applyFavorites);
-  allEvents = [...autoEvents, ...extrasEvents];
+  if(storedSources && storedSources.length){
+    // Retrocompatibilidade: sites guardados antes desta versão não têm
+    // ultimaAtualizacao — garantimos que o campo existe para não quebrar a ordenação.
+    allSources = storedSources.map(s => ({ultimaAtualizacao: null, ...s}));
+  }else{
+    allSources = seedSources();
+    await storageSet(SOURCES_KEY, allSources);
+  }
 
-  // Fontes do servidor + removidas pelo utilizador + extras manuais
-  allSources = mergeSourcesFromServer(fontesList||[]);
-
-  // Banner de estado do último refresh
-  renderRefreshBannerFromData(evData);
+  if(storedEvents && storedEvents.length){
+    allEvents = storedEvents;
+  }else{
+    allEvents = seedEvents();
+    await storageSet(EVENTS_KEY, allEvents);
+  }
 
   buildStaticSelects();
   renderAll();
   wireEvents();
-}
-
-// Aplica isFavorito com base no localStorage (chave estável)
-function applyFavorites(ev){
-  const favSet = new Set(lsGet(LS_FAVORITOS)||[]);
-  return {...ev, isFavorito: favSet.has(chavEstavel(ev))};
-}
-
-// Merge de fontes no modo online (fontes.json + adicionadas - removidas)
-function mergeSourcesFromServer(fontesList){
-  const removidas = new Set(lsGet(LS_FONTES_REMOVIDAS)||[]);
-  const extras = lsGet(LS_FONTES_EXTRAS)||[];
-  return [
-    ...fontesList.filter(s=>!removidas.has(s.id)).map(s=>({ultimaAtualizacao:null,...s})),
-    ...extras
-  ];
-}
-
-// Merge de fontes no modo offline (snapshot)
-function mergeSourcesFromSnapshot(fontesList){
-  const extras = lsGet(LS_FONTES_EXTRAS)||[];
-  return [...fontesList.map(s=>({ultimaAtualizacao:null,...s})), ...extras];
+  await renderRefreshStatus();
 }
 
 function buildStaticSelects(){
@@ -1536,21 +3043,36 @@ function renderHighlights(){
   }).join('');
 }
 
-function renderRefreshBannerFromData(evData){
+async function renderRefreshStatus(){
   const meta = document.getElementById('refreshMeta');
   const banner = document.getElementById('topStatusBanner');
-  if(!evData || !evData.atualizadoEm){
-    meta.textContent = 'Ainda não foi feita nenhuma atualização automática.';
+  const last = await storageGet(LASTREFRESH_KEY);
+
+  if(!last || !last.quando){
+    meta.textContent = 'Ainda não foi feita nenhuma pesquisa automática.';
     banner.className = 'status-banner status-banner--info';
-    banner.textContent = 'ℹ️ Ainda sem dados — vai a GitHub → Actions → "Atualizar eventos" → "Run workflow" para a primeira pesquisa.';
+    banner.textContent = 'ℹ️ Ainda não foi feita nenhuma atualização automática — usem o botão "Atualizar eventos" para procurar os primeiros eventos reais.';
     return;
   }
-  const d = new Date(evData.atualizadoEm);
-  const dataFmt = d.toLocaleDateString('pt-PT') + ' às ' + d.toLocaleTimeString('pt-PT',{hour:'2-digit',minute:'2-digit'});
-  const totalTxt = typeof evData.total==='number' ? ` · ${evData.total} eventos` : '';
-  meta.textContent = `Última atualização: ${dataFmt}${totalTxt}`;
-  banner.className = 'status-banner status-banner--success';
-  banner.textContent = `✅ Última atualização automática: ${dataFmt}${totalTxt ? ` —${totalTxt.slice(2)}.` : '.'}`;
+
+  const d = new Date(last.quando);
+  const dataFmt = d.toLocaleDateString('pt-PT') + ' às ' + d.toLocaleTimeString('pt-PT', {hour:'2-digit', minute:'2-digit'});
+
+  if(last.sucesso===false){
+    meta.textContent = `Última tentativa falhou: ${dataFmt}`;
+    banner.className = 'status-banner status-banner--error';
+    banner.textContent = `⚠️ A última tentativa de atualização (${dataFmt}) não correu bem. Tentem novamente em "Atualizar eventos".`;
+  }else{
+    const totalTxt = typeof last.total==='number' ? ` · ${last.total} eventos encontrados` : '';
+    const avisos = [];
+    if(last.incompleta) avisos.push('algumas respostas ficaram incompletas');
+    if(last.lotesComFalha) avisos.push(`${last.lotesComFalha} lote(s) de sites falharam`);
+    const avisoTxt = avisos.length ? ` (${avisos.join('; ')} — pode haver mais por encontrar)` : '';
+    meta.textContent = `Última atualização: ${dataFmt}${totalTxt}${avisoTxt}`;
+    banner.className = avisos.length ? 'status-banner status-banner--info' : 'status-banner status-banner--success';
+    const icone = avisos.length ? 'ℹ️' : '✅';
+    banner.textContent = `${icone} Última atualização: ${dataFmt}${totalTxt ? ` —${totalTxt.slice(2)}.` : '.'}${avisos.length ? ` ${avisos.join('; ')} — tentem atualizar de novo para tentar completar.` : ''}`;
+  }
 }
 
 function renderAll(){
@@ -1592,11 +3114,270 @@ function abrirEdicaoEvento(id){
    o array JSON não chega a fechar corretamente. Em vez de perder tudo, esta função
    percorre o texto e recupera apenas os objetos {...} de topo que ficaram completos
    antes do corte, ignorando o objeto incompleto do final. */
+function extrairObjetosCompletos(str){
+  const objetos = [];
+  let depth = 0;
+  let inicioObj = -1;
+  let dentroString = false;
+  let escape = false;
 
+  for(let i=0; i<str.length; i++){
+    const ch = str[i];
+    if(dentroString){
+      if(escape) escape = false;
+      else if(ch==='\\') escape = true;
+      else if(ch==='"') dentroString = false;
+      continue;
+    }
+    if(ch==='"'){ dentroString = true; continue; }
+    if(ch==='{'){
+      if(depth===0) inicioObj = i;
+      depth++;
+    }else if(ch==='}'){
+      depth--;
+      if(depth===0 && inicioObj!==-1){
+        const trecho = str.slice(inicioObj, i+1);
+        try{ objetos.push(JSON.parse(trecho)); }catch(e){ /* objeto malformado — ignora */ }
+        inicioObj = -1;
+      }
+    }
+  }
+  return objetos;
+}
+
+const TAMANHO_LOTE = 5;
+const INTERVALO_MIN_DIAS = 5; // Não repesquisar um site atualizado há menos de X dias
 
 /* Pesquisa um único lote de sites e devolve os eventos encontrados.
    Mantém-se isolada para que uma falha num lote não arraste os restantes. */
+async function pesquisarLoteDeSites(lote){
+  const sitesList = lote.map(s=>`- ${s.nome} (${s.url})${s.nota ? ` — nota: ${s.nota}` : ''}`).join('\n');
+  const hoje = hojeISO();
+  const prompt = `Procura eventos futuros para crianças (idades entre 0 e 14 anos) na zona do Grande Porto, Portugal, consultando estes sites:
+${sitesList}
 
+Data de hoje: ${hoje}. Considera apenas eventos com data de início entre hoje e os próximos 60 dias. Usa a pesquisa na web para verificar a agenda de cada site sempre que possível e procura datas concretas, não descrições vagas.
+
+Devolve no máximo 6 eventos (escolhe os mais relevantes/próximos), com descrições muito curtas (até 8 palavras). É mais importante a resposta ficar completa e bem formatada do que teres muitos eventos — se tiveres dúvidas, prefere devolver menos eventos mas com o array todo fechado corretamente.
+
+IMPORTANTE — formato da resposta: a tua resposta final, depois de pesquisares, tem de conter SOMENTE o array JSON pedido. Não escrevas nenhuma frase antes (ex: "vou pesquisar...") nem depois (ex: "espero que ajude"), nem expliques o que fizeste — só o array, a começar em "[" e a terminar em "]", exatamente neste formato:
+[{"titulo":"...","fonte":"nome exato de um dos sites listados acima","local":"nome do espaço/sala, ou vazio","tipo":"um destes: Literatura, Workshop/Oficina, Música, Teatro/Espetáculo, Exposição, Ar livre, Família/Diversos, Cinema, Outro","idadeMin":numero,"idadeMax":numero,"dataInicio":"AAAA-MM-DD","dataFim":"AAAA-MM-DD ou vazio se for um único dia","hora":"HH:MM ou vazio","gratuito":true ou false ou null se não conseguires confirmar,"link":"URL direto do evento se encontrares, senão o URL do site","descricao":"até 8 palavras"}]
+
+Se não encontrares nenhum evento com data confirmada, devolve um array vazio [].`;
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1000,
+      system: "Respondes SEMPRE apenas com um array JSON válido, sem markdown, sem blocos de código, sem nenhum texto de introdução, narração da pesquisa ou conclusão antes ou depois do array.",
+      messages: [{ role: "user", content: prompt }],
+      tools: [{ type: "web_search_20250305", name: "web_search" }]
+    })
+  });
+
+  if(!response.ok) throw new Error('HTTP ' + response.status);
+  const data = await response.json();
+  const textOut = (data.content || []).filter(b=>b.type==='text').map(b=>b.text).join('\n').trim();
+
+  // O modelo pode, por vezes, escrever texto antes/depois do array, ou a resposta pode
+  // ficar cortada a meio (limite de tamanho da resposta). Em vez de falhar por completo,
+  // tentamos sempre aproveitar os eventos que ficaram completos antes de um eventual corte.
+  let clean = textOut.replace(/```json|```/g, '').trim();
+  const inicioArray = clean.indexOf('[');
+  if(inicioArray===-1){
+    console.error('Resposta sem array JSON reconhecível:', textOut);
+    throw new Error('A resposta não continha nenhum evento reconhecível.');
+  }
+  const fimArray = clean.lastIndexOf(']');
+  clean = (fimArray>inicioArray) ? clean.slice(inicioArray, fimArray+1) : clean.slice(inicioArray);
+
+  let brutos;
+  let incompleta = false;
+  try{
+    brutos = JSON.parse(clean);
+  }catch(e){
+    // Resposta truncada a meio de um array válido: recupera apenas os objetos
+    // que ficaram completos antes do corte, em vez de perder tudo.
+    brutos = extrairObjetosCompletos(clean);
+    incompleta = true;
+    if(!brutos.length){
+      console.error('Falha ao interpretar JSON (sem objetos completos recuperáveis):', clean);
+      throw new Error('A resposta ficou incompleta e não foi possível recuperar nenhum evento.');
+    }
+    console.warn(`Resposta truncada — foram recuperados ${brutos.length} evento(s) antes do corte.`);
+  }
+  if(!Array.isArray(brutos)) throw new Error('Resposta em formato inesperado');
+
+  const nomesValidos = new Set(lote.map(s=>s.nome));
+  const tiposValidos = new Set(TYPES);
+  const isoValido = v => typeof v==='string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
+
+  const limpos = brutos
+    .filter(e => e && e.titulo && isoValido(e.dataInicio))
+    .map(e => ({
+      id: uid(),
+      titulo: String(e.titulo).slice(0,140),
+      fonte: nomesValidos.has(e.fonte) ? e.fonte : lote[0].nome,
+      local: e.local ? String(e.local).slice(0,140) : '',
+      tipo: tiposValidos.has(e.tipo) ? e.tipo : 'Outro',
+      idadeMin: Number.isFinite(parseInt(e.idadeMin,10)) ? Math.max(0, Math.min(18, parseInt(e.idadeMin,10))) : 0,
+      idadeMax: Number.isFinite(parseInt(e.idadeMax,10)) ? Math.max(0, Math.min(18, parseInt(e.idadeMax,10))) : 18,
+      dataInicio: e.dataInicio,
+      dataFim: isoValido(e.dataFim) ? e.dataFim : '',
+      hora: e.hora ? String(e.hora).slice(0,20) : '',
+      gratuito: e.gratuito===true ? true : (e.gratuito===false ? false : null),
+      link: e.link ? String(e.link).slice(0,500) : '',
+      descricao: e.descricao ? String(e.descricao).slice(0,300) : '',
+      isExample: false,
+      isAuto: true
+    }))
+    .filter(ev => !isPassado(ev));
+
+  return { eventos: limpos, incompleta };
+}
+
+async function refreshEvents(){
+  const btn = document.getElementById('refreshBtn');
+  const meta = document.getElementById('refreshMeta');
+
+  if(!allSources.length){
+    meta.textContent = 'Associem pelo menos um site antes de atualizar.';
+    return;
+  }
+
+  btn.disabled = true;
+  const originalLabel = btn.textContent;
+
+  // Ordena os sites pelo timestamp mais antigo primeiro — nunca pesquisados têm prioridade.
+  const sitesOrdenados = [...allSources].sort((a,b)=>{
+    if(!a.ultimaAtualizacao && !b.ultimaAtualizacao) return 0;
+    if(!a.ultimaAtualizacao) return -1;
+    if(!b.ultimaAtualizacao) return 1;
+    return a.ultimaAtualizacao.localeCompare(b.ultimaAtualizacao);
+  });
+
+  // Filtra só os sites que precisam de ser pesquisados: nunca pesquisados, ou com
+  // timestamp mais antigo que INTERVALO_MIN_DIAS dias. Os restantes são saltados
+  // para poupar créditos — já têm dados recentes.
+  const limiteMs = INTERVALO_MIN_DIAS * 24 * 60 * 60 * 1000;
+  const agora = Date.now();
+  const sitesParaPesquisar = sitesOrdenados.filter(s => {
+    if(!s.ultimaAtualizacao) return true;
+    return (agora - new Date(s.ultimaAtualizacao).getTime()) > limiteMs;
+  });
+  const sitesSaltados = sitesOrdenados.length - sitesParaPesquisar.length;
+
+  if(!sitesParaPesquisar.length){
+    // Todos os sites foram pesquisados recentemente — mostra quando o mais antigo expira.
+    const maisAntigo = sitesOrdenados[0];
+    const expiracaoMs = new Date(maisAntigo.ultimaAtualizacao).getTime() + limiteMs;
+    const dias = Math.ceil((expiracaoMs - agora) / 86400000);
+    meta.textContent = `Todos os sites foram pesquisados há menos de ${INTERVALO_MIN_DIAS} dias. Próxima atualização recomendada daqui a ${dias} dia(s).`;
+    btn.disabled = false;
+    return;
+  }
+
+  if(sitesSaltados > 0){
+    meta.textContent = `A pesquisar ${sitesParaPesquisar.length} site(s) — ${sitesSaltados} saltado(s) por terem sido pesquisados há menos de ${INTERVALO_MIN_DIAS} dias.`;
+  }
+
+  const lotes = [];
+  for(let i=0; i<sitesParaPesquisar.length; i+=TAMANHO_LOTE){
+    lotes.push(sitesParaPesquisar.slice(i, i+TAMANHO_LOTE));
+  }
+
+  // Começa do zero no que toca a eventos encontrados automaticamente;
+  // mantém os exemplos e quaisquer outros eventos já existentes.
+  allEvents = allEvents.filter(ev => !ev.isAuto);
+  await storageSet(EVENTS_KEY, allEvents);
+  renderEvents();
+  renderHighlights();
+  renderStats();
+
+  let totalEncontrados = 0;
+  let algumaIncompleta = false;
+  let lotesComFalha = 0;
+
+  for(let i=0; i<lotes.length; i++){
+    const lote = lotes[i];
+    const numeroLote = i+1;
+    const deSite = i*TAMANHO_LOTE + 1;
+    const aSite = Math.min((i+1)*TAMANHO_LOTE, sitesParaPesquisar.length);
+    const totalInfo = sitesSaltados > 0
+      ? `${sitesParaPesquisar.length} a pesquisar, ${sitesSaltados} saltados`
+      : `${sitesParaPesquisar.length} sites`;
+
+    btn.textContent = `A pesquisar… (lote ${numeroLote}/${lotes.length})`;
+    meta.textContent = `A atualizar sites ${deSite}–${aSite} de ${sitesParaPesquisar.length} (lote ${numeroLote} de ${lotes.length}${sitesSaltados > 0 ? ` · ${sitesSaltados} saltados` : ''})…`;
+
+    try{
+      const { eventos, incompleta } = await pesquisarLoteDeSites(lote);
+      if(incompleta) algumaIncompleta = true;
+
+      // Deduplicação: ignora eventos com o mesmo título normalizado + data de início
+      // que já existam na lista (mesmo que venham de sites diferentes).
+      // Isto evita duplicados quando o mesmo evento aparece em vários agregadores.
+      const chaveExistente = new Set(
+        allEvents.map(ev => `${ev.titulo.trim().toLowerCase()}|${ev.dataInicio}`)
+      );
+      const eventosSemDuplicados = eventos.filter(ev => {
+        const chave = `${ev.titulo.trim().toLowerCase()}|${ev.dataInicio}`;
+        if(chaveExistente.has(chave)) return false;
+        chaveExistente.add(chave); // evita duplicados dentro do mesmo lote
+        return true;
+      });
+      totalEncontrados += eventosSemDuplicados.length;
+
+      // Após cada lote com sucesso, grava imediatamente:
+      // 1. os eventos encontrados (para não perder se o lote seguinte falhar)
+      // 2. o timestamp de cada site deste lote (para a próxima atualização os saltar
+      //    e ir diretamente para os que ainda não foram pesquisados)
+      allEvents = allEvents.concat(eventosSemDuplicados);
+      await storageSet(EVENTS_KEY, allEvents);
+
+      const agora = new Date().toISOString();
+      const idsLote = new Set(lote.map(s=>s.id));
+      allSources = allSources.map(s => idsLote.has(s.id) ? {...s, ultimaAtualizacao: agora} : s);
+      await storageSet(SOURCES_KEY, allSources);
+
+      renderEvents();
+      renderHighlights();
+      renderSources();
+      renderStats();
+    }catch(err){
+      console.error(`Lote ${numeroLote} (sites ${deSite}–${aSite}) falhou:`, err);
+      lotesComFalha++;
+    }
+  }
+
+  const sucessoGeral = lotesComFalha < lotes.length;
+  const registo = {
+    quando: new Date().toISOString(),
+    total: totalEncontrados,
+    sucesso: sucessoGeral,
+    incompleta: algumaIncompleta,
+    lotesComFalha
+  };
+  await storageSet(LASTREFRESH_KEY, registo);
+  await renderRefreshStatus();
+
+  if(!sucessoGeral){
+    meta.textContent = 'Não foi possível atualizar agora. Tentem novamente dentro de momentos.';
+  }else{
+    let msg = totalEncontrados
+      ? `${totalEncontrados} eventos encontrados em ${lotes.length} lote(s).`
+      : `Pesquisa concluída em ${lotes.length} lote(s) — sem eventos novos com data confirmada.`;
+    if(sitesSaltados > 0) msg += ` ${sitesSaltados} site(s) saltados (pesquisados há menos de ${INTERVALO_MIN_DIAS} dias).`;
+    if(algumaIncompleta) msg += ' Algumas respostas ficaram incompletas — pode haver mais.';
+    if(lotesComFalha) msg += ` ${lotesComFalha} lote(s) falharam — tentem atualizar de novo.`;
+    meta.textContent = msg;
+  }
+
+  btn.disabled = false;
+  btn.textContent = originalLabel;
+}
 
 async function exportSnapshot(){
   const btn = document.getElementById('exportBtn');
@@ -1605,10 +3386,17 @@ async function exportSnapshot(){
 
   try{
     // Lê os dados atuais do storage (para garantir que estão sincronizados)
+    const [evts, srcs, lastR] = await Promise.all([
+      storageGet(EVENTS_KEY),
+      storageGet(SOURCES_KEY),
+      storageGet(LASTREFRESH_KEY)
+    ]);
+
     const snapshot = {
       exportadoEm: new Date().toISOString(),
-      eventos: allEvents,
-      fontes: allSources
+      eventos: evts || allEvents,
+      fontes: srcs || allSources,
+      ultimaAtualizacao: lastR || null
     };
 
     // Lê o HTML desta página e substitui SNAPSHOT_DATA = null pelos dados reais.
@@ -1683,6 +3471,7 @@ function wireEvents(){
   document.getElementById('sourceSelect').addEventListener('change', e=>{ filters.source=e.target.value; renderEvents(); });
   document.getElementById('quandoSelect').addEventListener('change', e=>{ filters.quando=e.target.value; renderEvents(); });
 
+  document.getElementById('refreshBtn').addEventListener('click', refreshEvents);
 
   document.getElementById('eventsGrid').addEventListener('click', async e=>{
     const shareBtn = e.target.closest('[data-share-event]');
@@ -1694,16 +3483,8 @@ function wireEvents(){
     const favBtn = e.target.closest('[data-fav-event]');
     if(favBtn){
       const id = favBtn.dataset.favEvent;
-      allEvents = allEvents.map(ev => {
-        if(ev.id !== id) return ev;
-        const novoEstado = !ev.isFavorito;
-        // Guardar em localStorage por chave estável (sobrevive a refrescos do servidor)
-        const favs = new Set(lsGet(LS_FAVORITOS)||[]);
-        const chave = chavEstavel(ev);
-        novoEstado ? favs.add(chave) : favs.delete(chave);
-        lsSet(LS_FAVORITOS, [...favs]);
-        return {...ev, isFavorito: novoEstado};
-      });
+      allEvents = allEvents.map(ev => ev.id===id ? {...ev, isFavorito: !ev.isFavorito} : ev);
+      await storageSet(EVENTS_KEY, allEvents);
       renderEvents();
       renderHighlights();
       return;
@@ -1716,20 +3497,8 @@ function wireEvents(){
     const btn = e.target.closest('[data-remove-event]');
     if(!btn) return;
     const id = btn.dataset.removeEvent;
-    const ev = allEvents.find(e=>e.id===id);
-    if(ev){
-      if(ev.isAuto){
-        // Eventos automáticos: ocultar por chave estável (voltariam no próximo refresh)
-        const ocultos = new Set(lsGet(LS_EVENTOS_OCULTOS)||[]);
-        ocultos.add(chavEstavel(ev));
-        lsSet(LS_EVENTOS_OCULTOS, [...ocultos]);
-      }else{
-        // Eventos manuais/editados: remover do localStorage
-        const extras = (lsGet(LS_EVENTOS_EXTRAS)||[]).filter(e=>e.id!==id);
-        lsSet(LS_EVENTOS_EXTRAS, extras);
-      }
-    }
     allEvents = allEvents.filter(ev=>ev.id!==id);
+    await storageSet(EVENTS_KEY, allEvents);
     renderEvents();
     renderHighlights();
     renderStats();
@@ -1746,18 +3515,8 @@ function wireEvents(){
     const btn = e.target.closest('[data-remove-source]');
     if(!btn) return;
     const id = btn.dataset.removeSource;
-    // Verificar se é uma fonte do servidor (fontes.json) ou adicionada pelo utilizador
-    const extras = lsGet(LS_FONTES_EXTRAS)||[];
-    const eraExtra = extras.some(s=>s.id===id);
-    if(eraExtra){
-      lsSet(LS_FONTES_EXTRAS, extras.filter(s=>s.id!==id));
-    }else{
-      // Fonte do servidor: guardar ID como removida
-      const removidas = lsGet(LS_FONTES_REMOVIDAS)||[];
-      if(!removidas.includes(id)) removidas.push(id);
-      lsSet(LS_FONTES_REMOVIDAS, removidas);
-    }
     allSources = allSources.filter(s=>s.id!==id);
+    await storageSet(SOURCES_KEY, allSources);
     renderSourceSelect();
     renderSources();
     renderStats();
@@ -1815,18 +3574,7 @@ function wireEvents(){
     };
 
     allEvents = allEvents.map(ev => ev.id===eventoEmEdicaoId ? { ...ev, ...dadosEditados } : ev);
-    // Guardar evento editado em localStorage
-    // Se era auto, passa a ser "extra" (manual) para persistir entre refrescos
-    const editado = allEvents.find(ev=>ev.id===eventoEmEdicaoId);
-    if(editado){
-      const extras = (lsGet(LS_EVENTOS_EXTRAS)||[]).filter(e=>e.id!==editado.id);
-      extras.push({...editado, isAuto:false, isEditado:true});
-      lsSet(LS_EVENTOS_EXTRAS, extras);
-      // Se era auto, marcar como oculto para não duplicar no próximo refresh
-      if(dadosEditados.isAuto === false){
-        // já está marcado como não-auto no dadosEditados
-      }
-    }
+    await storageSet(EVENTS_KEY, allEvents);
     closeModal(editModalOverlay);
     eventoEmEdicaoId = null;
     renderEvents();
@@ -1849,14 +3597,10 @@ function wireEvents(){
       nome: document.getElementById('src_nome').value.trim(),
       url: document.getElementById('src_url').value.trim(),
       tipoLocal: document.getElementById('src_tipo').value,
-      nota: document.getElementById('src_nota').value.trim(),
-      ultimaAtualizacao: null
+      nota: document.getElementById('src_nota').value.trim()
     };
     allSources.push(novaFonte);
-    // Fontes adicionadas pelo utilizador guardam-se em localStorage
-    const extras = lsGet(LS_FONTES_EXTRAS)||[];
-    extras.push(novaFonte);
-    lsSet(LS_FONTES_EXTRAS, extras);
+    await storageSet(SOURCES_KEY, allSources);
     closeModal(sourceModalOverlay);
     renderSourceSelect();
     renderSources();
@@ -1872,6 +3616,7 @@ function wireEvents(){
     if(!removidos){
       return; // nada a limpar
     }
+    await storageSet(EVENTS_KEY, allEvents);
     renderEvents();
     renderHighlights();
     renderStats();
@@ -1890,5 +3635,6 @@ function wireEvents(){
 
 init();
 </script>
-</body>
-</html>
+
+
+</body></html>
