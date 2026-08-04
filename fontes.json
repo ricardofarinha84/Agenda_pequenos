@@ -1,0 +1,114 @@
+[
+  {
+    "id": "bmp",
+    "nome": "Bibliotecas Municipais do Porto",
+    "url": "https://bmp.cm-porto.pt",
+    "tipoLocal": "Biblioteca",
+    "nota": "Hora do conto e ateliês quase todos os sábados",
+    "ultimaAtualizacao": null
+  },
+  {
+    "id": "casadamusica",
+    "nome": "Casa da Música",
+    "url": "https://www.casadamusica.com",
+    "tipoLocal": "Sala de Espetáculos / Teatro",
+    "nota": "Tem ciclo regular de concertos em família",
+    "ultimaAtualizacao": null
+  },
+  {
+    "id": "coliseu",
+    "nome": "Coliseu Porto Ageas",
+    "url": "https://www.coliseu.pt",
+    "tipoLocal": "Sala de Espetáculos / Teatro",
+    "nota": "",
+    "ultimaAtualizacao": null
+  },
+  {
+    "id": "tnsj",
+    "nome": "Teatro Nacional São João",
+    "url": "https://www.tnsj.pt",
+    "tipoLocal": "Sala de Espetáculos / Teatro",
+    "nota": "",
+    "ultimaAtualizacao": null
+  },
+  {
+    "id": "teatromunicipal",
+    "nome": "Teatro Municipal do Porto",
+    "url": "https://www.teatromunicipaldoporto.pt",
+    "tipoLocal": "Sala de Espetáculos / Teatro",
+    "nota": "Rivoli e Campo Alegre",
+    "ultimaAtualizacao": null
+  },
+  {
+    "id": "serralves",
+    "nome": "Serralves",
+    "url": "https://www.serralves.pt",
+    "tipoLocal": "Espaço ao ar livre / Parque",
+    "nota": "Programação em família ao fim de semana",
+    "ultimaAtualizacao": null
+  },
+  {
+    "id": "museucidade",
+    "nome": "Museu da Cidade do Porto",
+    "url": "https://museudoporto.pt",
+    "tipoLocal": "Museu",
+    "nota": "",
+    "ultimaAtualizacao": null
+  },
+  {
+    "id": "balleteatro",
+    "nome": "Balleteatro",
+    "url": "https://www.balleteatro.pt",
+    "tipoLocal": "Sala de Espetáculos / Teatro",
+    "nota": "Oficinas para bebés e pequenos",
+    "ultimaAtualizacao": null
+  },
+  {
+    "id": "zoosantoinacio",
+    "nome": "Zoo Santo Inácio",
+    "url": "https://www.zoosantoinacio.com",
+    "tipoLocal": "Espaço ao ar livre / Parque",
+    "nota": "Confirmar horários sazonais",
+    "ultimaAtualizacao": null
+  },
+  {
+    "id": "sealife",
+    "nome": "SEA LIFE Porto",
+    "url": "https://www.visitsealife.com/porto/",
+    "tipoLocal": "Museu",
+    "nota": "",
+    "ultimaAtualizacao": null
+  },
+  {
+    "id": "worldofdiscoveries",
+    "nome": "World of Discoveries",
+    "url": "https://www.worldofdiscoveries.com",
+    "tipoLocal": "Museu",
+    "nota": "",
+    "ultimaAtualizacao": null
+  },
+  {
+    "id": "iporto",
+    "nome": "iPorto — Agenda Metropolitana da Cultura",
+    "url": "https://iporto.amp.pt",
+    "tipoLocal": "Agregador de eventos",
+    "nota": "Junta eventos de toda a área metropolitana, com filtro Infantil e Juvenil",
+    "ultimaAtualizacao": null
+  },
+  {
+    "id": "viralagenda",
+    "nome": "Viral Agenda — Porto Kids",
+    "url": "https://www.viralagenda.com/pt/porto/kids",
+    "tipoLocal": "Agregador de eventos",
+    "nota": "",
+    "ultimaAtualizacao": null
+  },
+  {
+    "id": "pumpkin",
+    "nome": "Pumpkin.pt — Agenda Família",
+    "url": "https://pumpkin.pt/agenda/",
+    "tipoLocal": "Agregador de eventos",
+    "nota": "",
+    "ultimaAtualizacao": null
+  }
+]
