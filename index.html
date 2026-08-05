@@ -3164,16 +3164,19 @@ function buildShareText(ev){
   return linhas.join('\n');
 }
 
-function shareOnWhatsApp(ev){
-  const url = 'https://wa.me/?text=' + encodeURIComponent(buildShareText(ev));
-  // Usa <a> em vez de window.open() — browsers não bloqueiam navegação via <a>
+function abrirLinkExterno(href){
+  if(!href) return;
   const a = document.createElement('a');
-  a.href = url;
+  a.href = href;
   a.target = '_blank';
   a.rel = 'noopener';
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
+}
+
+function shareOnWhatsApp(ev){
+  abrirLinkExterno('https://wa.me/?text=' + encodeURIComponent(buildShareText(ev)));
 }
 
 /* ---------- Google Calendar ---------- */
@@ -3792,6 +3795,12 @@ function wireEvents(){
   document.getElementById('refreshBtn').addEventListener('click', refreshEvents);
 
   document.getElementById('eventsGrid').addEventListener('click', e=>{
+    // Links externos interceptados explicitamente para garantir abertura em nova aba
+    const linkChip = e.target.closest('.schedule-chip--link');
+    if(linkChip){ e.preventDefault(); abrirLinkExterno(linkChip.getAttribute('href')); return; }
+    const calLink = e.target.closest('.gcal-btn');
+    if(calLink){ e.preventDefault(); abrirLinkExterno(calLink.getAttribute('href')); return; }
+
     const shareBtn = e.target.closest('[data-share-event]');
     if(shareBtn){
       const ev = allEvents.find(item=>item.id===shareBtn.dataset.shareEvent);
@@ -3823,6 +3832,11 @@ function wireEvents(){
   });
 
   document.getElementById('highlightsRow').addEventListener('click', e=>{
+    const highlightLink = e.target.closest('.highlight-link');
+    if(highlightLink){ e.preventDefault(); abrirLinkExterno(highlightLink.getAttribute('href')); return; }
+    const calLink = e.target.closest('.gcal-btn');
+    if(calLink){ e.preventDefault(); abrirLinkExterno(calLink.getAttribute('href')); return; }
+
     const shareBtn = e.target.closest('[data-share-event]');
     if(!shareBtn) return;
     const ev = allEvents.find(item=>item.id===shareBtn.dataset.shareEvent);
