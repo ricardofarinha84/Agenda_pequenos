@@ -2843,8 +2843,12 @@ function exportarDadosJSON(){
       fontes: allSources
     };
     const json = JSON.stringify(dados, null, 2);
-    // Usa data URI — mais compatível com ambientes sandbox do que Blob+createObjectURL
-    const dataUri = 'data:application/json;charset=utf-8,' + encodeURIComponent(json);
+    // O ambiente do Claude.ai usa atob() para descodificar data URIs, por isso
+    // é necessário usar base64 explicitamente (encodeURIComponent não funciona aqui).
+    // unescape(encodeURIComponent(...)) converte UTF-8 para Latin1 antes do btoa,
+    // necessário para suportar carateres portugueses (á, ã, ê, etc.).
+    const base64 = btoa(unescape(encodeURIComponent(json)));
+    const dataUri = 'data:application/json;base64,' + base64;
     const a = document.createElement('a');
     a.href = dataUri;
     a.download = 'dados.json';
