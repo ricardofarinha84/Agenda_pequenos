@@ -2817,19 +2817,42 @@ async function storageGet(key){ return null; }
 async function storageSet(key, value){ return true; }
 async function storageDelete(key){ return true; }
 
-// URL do dados.json no GitHub Pages — atualiza aqui se mudares o repositório
+// URL do dados.json no GitHub Pages
 const DADOS_URL = 'https://ricardofarinha84.github.io/Agenda_pequenos/dados.json';
 
 async function fetchDadosGitHub(){
   try{
     const res = await Promise.race([
-      fetch(DADOS_URL + '?t=' + Date.now()), // cache-bust para forçar dados frescos
+      fetch(DADOS_URL + '?t=' + Date.now()),
       new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 5000))
     ]);
     if(!res || !res.ok) return null;
-    return await res.json();
-  }catch(e){
-    return null;
+    const dados = await res.json();
+    // Só considera válido se tiver pelo menos eventos ou fontes com conteúdo
+    if(!dados || (!dados.eventos?.length && !dados.fontes?.length)) return null;
+    return dados;
+  }catch(e){ return null; }
+}
+
+function exportarDadosJSON(){
+  try{
+    const dados = {
+      exportadoEm: new Date().toISOString(),
+      total: allEvents.filter(ev => ev.isAuto).length,
+      eventos: allEvents,
+      fontes: allSources
+    };
+    const json = JSON.stringify(dados, null, 2);
+    // Usa data URI — mais compatível com ambientes sandbox do que Blob+createObjectURL
+    const dataUri = 'data:application/json;charset=utf-8,' + encodeURIComponent(json);
+    const a = document.createElement('a');
+    a.href = dataUri;
+    a.download = 'dados.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }catch(err){
+    console.error('Erro ao exportar dados.json:', err);
   }
 }
 
@@ -2838,7 +2861,7 @@ async function init(){
 
   // ── 1. Tentar buscar dados frescos do GitHub Pages ─────────────────────────
   const dadosGitHub = await fetchDadosGitHub();
-  if(dadosGitHub && (dadosGitHub.eventos || dadosGitHub.fontes)){
+  if(dadosGitHub){
     allEvents = dadosGitHub.eventos || [];
     allSources = (dadosGitHub.fontes || []).map(s => ({ultimaAtualizacao: null, ...s}));
     buildStaticSelects();
@@ -2855,7 +2878,7 @@ async function init(){
     return;
   }
 
-  // ── 2. Fallback: SNAPSHOT_DATA embutido (se disponível) ───────────────────
+  // ── 2. Fallback: SNAPSHOT_DATA embutido ───────────────────────────────────
   if(SNAPSHOT_DATA !== null){
     allEvents = SNAPSHOT_DATA.eventos || [];
     allSources = (SNAPSHOT_DATA.fontes || []).map(s => ({ultimaAtualizacao: null, ...s}));
@@ -2868,12 +2891,12 @@ async function init(){
       ? new Date(SNAPSHOT_DATA.exportadoEm).toLocaleDateString('pt-PT') + ' às ' + new Date(SNAPSHOT_DATA.exportadoEm).toLocaleTimeString('pt-PT', {hour:'2-digit', minute:'2-digit'})
       : 'data desconhecida';
     banner.className = 'status-banner status-banner--info';
-    banner.textContent = `📋 GitHub indisponível — a usar snapshot de ${quando}. Verifica a tua ligação ou carrega dados.json para o GitHub.`;
-    meta.textContent = `Snapshot local · ${quando} · ${allEvents.length} eventos`;
+    banner.textContent = `📋 GitHub indisponível — a usar snapshot de ${quando}. Faz refresh e exporta dados.json para o GitHub.`;
+    meta.textContent = `Snapshot · ${quando} · ${allEvents.length} eventos`;
     return;
   }
 
-  // ── 3. Sem dados — começar do zero ───────────────────────────────────────
+  // ── 3. Sem dados — começar do zero ────────────────────────────────────────
   allSources = seedSources();
   allEvents = [];
   buildStaticSelects();
@@ -2881,7 +2904,7 @@ async function init(){
   wireEvents();
   const banner = document.getElementById('topStatusBanner');
   banner.className = 'status-banner status-banner--info';
-  banner.textContent = 'ℹ️ Sem dados disponíveis — faz "Atualizar eventos" para pesquisar nos sites associados.';
+  banner.textContent = 'ℹ️ Sem dados — faz "Atualizar eventos" para pesquisar nos sites associados.';
 }
 
 function buildStaticSelects(){
@@ -3720,24 +3743,6 @@ async function refreshEvents(){
 
   btn.disabled = false;
   btn.textContent = originalLabel;
-}
-
-function exportarDadosJSON(){
-  const dados = {
-    exportadoEm: new Date().toISOString(),
-    total: allEvents.filter(ev => ev.isAuto).length,
-    eventos: allEvents,
-    fontes: allSources
-  };
-  const blob = new Blob([JSON.stringify(dados, null, 2)], {type: 'application/json;charset=utf-8'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'dados.json';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
 }
 
 async function exportSnapshot(){
