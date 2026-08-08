@@ -2083,7 +2083,8 @@ button[disabled]{opacity:0.6; cursor:not-allowed;}
 
   <footer class="page-footer">
     Os vossos dados ficam guardados na vossa conta, só para esta família.
-    <button class="link-btn" id="exportBtn" disabled="">⏳ A preparar…</button>
+    <button class="link-btn" id="exportDadosBtn">⬇️ Exportar dados.json</button>
+    <button class="link-btn" id="exportBtn">⬇️ Exportar com dados</button>
     <button class="link-btn" id="clearExamplesBtn">Limpar exemplos</button>
     <span class="version-stamp">🕓 02/07/2026, 12:54 (UTC)</span>
   </footer>
@@ -2816,10 +2817,45 @@ async function storageGet(key){ return null; }
 async function storageSet(key, value){ return true; }
 async function storageDelete(key){ return true; }
 
+// URL do dados.json no GitHub Pages — atualiza aqui se mudares o repositório
+const DADOS_URL = 'https://ricardofarinha84.github.io/Agenda_pequenos/dados.json';
+
+async function fetchDadosGitHub(){
+  try{
+    const res = await Promise.race([
+      fetch(DADOS_URL + '?t=' + Date.now()), // cache-bust para forçar dados frescos
+      new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 5000))
+    ]);
+    if(!res || !res.ok) return null;
+    return await res.json();
+  }catch(e){
+    return null;
+  }
+}
+
 async function init(){
   document.getElementById('resultsCount').textContent = 'A carregar…';
 
-  // Modo offline (ficheiro com dados embutidos) — SNAPSHOT_DATA não é null.
+  // ── 1. Tentar buscar dados frescos do GitHub Pages ─────────────────────────
+  const dadosGitHub = await fetchDadosGitHub();
+  if(dadosGitHub && (dadosGitHub.eventos || dadosGitHub.fontes)){
+    allEvents = dadosGitHub.eventos || [];
+    allSources = (dadosGitHub.fontes || []).map(s => ({ultimaAtualizacao: null, ...s}));
+    buildStaticSelects();
+    renderAll();
+    wireEvents();
+    const banner = document.getElementById('topStatusBanner');
+    const meta = document.getElementById('refreshMeta');
+    const quando = dadosGitHub.exportadoEm
+      ? new Date(dadosGitHub.exportadoEm).toLocaleDateString('pt-PT') + ' às ' + new Date(dadosGitHub.exportadoEm).toLocaleTimeString('pt-PT', {hour:'2-digit', minute:'2-digit'})
+      : 'data desconhecida';
+    banner.className = 'status-banner status-banner--success';
+    banner.textContent = `✅ Dados carregados do GitHub em ${quando} — ${allEvents.length} eventos, ${allSources.length} sites.`;
+    meta.textContent = `GitHub · ${quando} · ${allEvents.length} eventos`;
+    return;
+  }
+
+  // ── 2. Fallback: SNAPSHOT_DATA embutido (se disponível) ───────────────────
   if(SNAPSHOT_DATA !== null){
     allEvents = SNAPSHOT_DATA.eventos || [];
     allSources = (SNAPSHOT_DATA.fontes || []).map(s => ({ultimaAtualizacao: null, ...s}));
@@ -2832,34 +2868,20 @@ async function init(){
       ? new Date(SNAPSHOT_DATA.exportadoEm).toLocaleDateString('pt-PT') + ' às ' + new Date(SNAPSHOT_DATA.exportadoEm).toLocaleTimeString('pt-PT', {hour:'2-digit', minute:'2-digit'})
       : 'data desconhecida';
     banner.className = 'status-banner status-banner--info';
-    banner.textContent = `📋 Snapshot exportado em ${quando}. Os dados estão embutidos neste ficheiro — abre a agenda online para atualizar.`;
-    meta.textContent = `Snapshot de ${quando} — ${allEvents.length} eventos, ${allSources.length} sites.`;
+    banner.textContent = `📋 GitHub indisponível — a usar snapshot de ${quando}. Verifica a tua ligação ou carrega dados.json para o GitHub.`;
+    meta.textContent = `Snapshot local · ${quando} · ${allEvents.length} eventos`;
     return;
   }
 
-  // Modo online — dados vêm do storage da conta Claude.
-  const [storedEvents, storedSources] = await Promise.all([storageGet(EVENTS_KEY), storageGet(SOURCES_KEY)]);
-
-  if(storedSources && storedSources.length){
-    // Retrocompatibilidade: sites guardados antes desta versão não têm
-    // ultimaAtualizacao — garantimos que o campo existe para não quebrar a ordenação.
-    allSources = storedSources.map(s => ({ultimaAtualizacao: null, ...s}));
-  }else{
-    allSources = seedSources();
-    await storageSet(SOURCES_KEY, allSources);
-  }
-
-  if(storedEvents && storedEvents.length){
-    allEvents = storedEvents;
-  }else{
-    allEvents = seedEvents();
-    await storageSet(EVENTS_KEY, allEvents);
-  }
-
+  // ── 3. Sem dados — começar do zero ───────────────────────────────────────
+  allSources = seedSources();
+  allEvents = [];
   buildStaticSelects();
   renderAll();
   wireEvents();
-  await renderRefreshStatus();
+  const banner = document.getElementById('topStatusBanner');
+  banner.className = 'status-banner status-banner--info';
+  banner.textContent = 'ℹ️ Sem dados disponíveis — faz "Atualizar eventos" para pesquisar nos sites associados.';
 }
 
 function buildStaticSelects(){
@@ -3700,6 +3722,24 @@ async function refreshEvents(){
   btn.textContent = originalLabel;
 }
 
+function exportarDadosJSON(){
+  const dados = {
+    exportadoEm: new Date().toISOString(),
+    total: allEvents.filter(ev => ev.isAuto).length,
+    eventos: allEvents,
+    fontes: allSources
+  };
+  const blob = new Blob([JSON.stringify(dados, null, 2)], {type: 'application/json;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'dados.json';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 async function exportSnapshot(){
   const btn = document.getElementById('exportBtn');
   btn.textContent = '⏳ A preparar…';
@@ -3953,6 +3993,7 @@ function wireEvents(){
     renderStats();
   });
 
+  document.getElementById('exportDadosBtn').addEventListener('click', exportarDadosJSON);
   document.getElementById('exportBtn').addEventListener('click', exportSnapshot);
 
   document.getElementById('clearExamplesBtn').addEventListener('click', async ()=>{
