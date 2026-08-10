@@ -3699,10 +3699,26 @@ async function exportSnapshot(){
     // Lê o HTML desta página e substitui SNAPSHOT_DATA = null pelos dados reais.
     const htmlAtual = document.documentElement.outerHTML;
     const dadosJS = `const SNAPSHOT_DATA = ${JSON.stringify(snapshot, null, 2)};`;
-    const htmlExportado = htmlAtual.replace(
-      /const SNAPSHOT_DATA = null;/,
-      dadosJS
-    );
+
+    // Substituir SNAPSHOT_DATA — funciona tanto quando é null (primeira exportação)
+    // como quando já é um objeto de uma exportação anterior.
+    const marcador = 'const SNAPSHOT_DATA = ';
+    const posInicio = htmlAtual.indexOf(marcador);
+    if(posInicio === -1) throw new Error('Marcador SNAPSHOT_DATA não encontrado no HTML.');
+
+    const resto = htmlAtual.slice(posInicio + marcador.length);
+    let posFim;
+    if(resto.startsWith('null;')){
+      // Caso simples: const SNAPSHOT_DATA = null;
+      posFim = posInicio + marcador.length + 'null;'.length;
+    }else{
+      // Caso objeto: JSON multi-linha — o fecho '}' do top-level fica em coluna 0 seguido de ';'
+      const fechoObj = '\n};';
+      const idxFecho = resto.indexOf(fechoObj);
+      if(idxFecho === -1) throw new Error('Fim do SNAPSHOT_DATA não encontrado.');
+      posFim = posInicio + marcador.length + idxFecho + fechoObj.length;
+    }
+    const htmlExportado = htmlAtual.slice(0, posInicio) + dadosJS + htmlAtual.slice(posFim);
 
     // Dispara o download
     const blob = new Blob([htmlExportado], {type: 'text/html;charset=utf-8'});
